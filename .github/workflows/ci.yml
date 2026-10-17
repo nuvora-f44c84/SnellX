@@ -1,0 +1,42 @@
+name: Offline validation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline-tests:
+    name: Mock tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Reproduce distribution and bootstrap
+        run: |
+          python3 scripts/build-snell-auto.py
+          python3 scripts/render-release-installer.py
+          git diff --exit-code -- outputs/snell-auto.sh outputs/snell-auto.sh.sha256 install.sh
+      - name: Offline regression tests (no root or real daemons)
+        run: |
+          for test_file in tests/test-*.py; do
+            python3 "$test_file"
+          done
+          bash tests/snell-net-tests.sh

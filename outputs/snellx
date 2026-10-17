@@ -1,0 +1,653 @@
+#!/usr/bin/env bash
+#
+# snellx - interactive manager for the Snell v6 installation created by snell-v6.sh
+#
+# Install:
+#   install -o root -g root -m 0755 snellx /usr/local/sbin/snellx
+#
+# Usage:
+#   snellx
+#   snellx status|show|update|restart|psk|port|logs|timer|check
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 077
+
+readonly CONFIG_PATH="/etc/snell-server/snell-server.conf"
+readonly STATE_DIR="/var/lib/snell-server"
+readonly PORT_STATE="${STATE_DIR}/port"
+readonly RELEASE_STATE="${STATE_DIR}/release"
+readonly MANAGER_PATH="/usr/local/sbin/snell-manager"
+readonly SERVICE_NAME="snell-server.service"
+readonly TIMER_NAME="snell-update.timer"
+readonly LOCK_FILE="/run/lock/snell-manager.lock"
+readonly NETWORK_TOOL="/usr/local/sbin/snell-net"
+readonly SECURITY_TOOL="/usr/local/sbin/snell-security"
+
+LOCK_HELD=0
+LAST_BACKUP=""
+
+if [[ -t 1 ]]; then
+  readonly C_RESET=$'\033[0m'
+  readonly C_BOLD=$'\033[1m'
+  readonly C_GREEN=$'\033[32m'
+  readonly C_YELLOW=$'\033[33m'
+  readonly C_RED=$'\033[31m'
+  readonly C_CYAN=$'\033[36m'
+else
+  readonly C_RESET=""
+  readonly C_BOLD=""
+  readonly C_GREEN=""
+  readonly C_YELLOW=""
+  readonly C_RED=""
+  readonly C_CYAN=""
+fi
+
+info() {
+  printf '%s[信息]%s %s\n' "$C_CYAN" "$C_RESET" "$*"
+}
+
+ok() {
+  printf '%s[成功]%s %s\n' "$C_GREEN" "$C_RESET" "$*"
+}
+
+warn() {
+  printf '%s[警告]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2
+}
+
+die() {
+  printf '%s[错误]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2
+  exit 1
+}
+
+cleanup() {
+  if [[ "$LOCK_HELD" -eq 1 ]]; then flock -u 9 || true; fi
+}
+trap cleanup EXIT
+
+require_root() {
+  [[ "$EUID" -eq 0 ]] || die "请使用 root 运行：sudo snellx"
+}
+
+require_systemd() {
+  command -v systemctl >/dev/null 2>&1 || die "未检测到 systemd。"
+  [[ -d /run/systemd/system ]] || die "systemd 当前未作为 init 系统运行。"
+}
+
+require_installation() {
+  [[ -f "$CONFIG_PATH" ]] || die "未找到配置：${CONFIG_PATH}"
+  [[ -x /usr/local/bin/snell-server ]] || die "未找到 Snell 程序：/usr/local/bin/snell-server"
+  systemctl cat "$SERVICE_NAME" >/dev/null 2>&1 || die "未找到 ${SERVICE_NAME}。"
+}
+
+acquire_lock() {
+  install -d -m 0755 /run/lock
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || die "另一个安装、升级或配置任务正在运行。"
+  LOCK_HELD=1
+}
+
+release_lock() {
+  if [[ "$LOCK_HELD" -eq 1 ]]; then flock -u 9 || true; fi
+  LOCK_HELD=0
+}
+
+pause_screen() {
+  [[ -t 0 ]] || return 0
+  printf '\n按 Enter 返回菜单……'
+  read -r _unused
+}
+
+confirm() {
+  local prompt="$1"
+  local answer=""
+  read -r -p "${prompt} [y/N]: " answer
+  [[ "$answer" == "y" || "$answer" == "Y" ]]
+}
+
+config_value() {
+  local key="$1"
+  awk -v wanted="$key" '
+    /^[[:space:]]*[#;]/ { next }
+    {
+      line = $0
+      sub(/^[[:space:]]*/, "", line)
+      if (index(line, wanted) == 1) {
+        rest = substr(line, length(wanted) + 1)
+        if (rest ~ /^[[:space:]]*=/) {
+          sub(/^[[:space:]]*=[[:space:]]*/, "", rest)
+          sub(/[[:space:]]*$/, "", rest)
+          print rest
+          exit
+        }
+      }
+    }
+  ' "$CONFIG_PATH"
+}
+
+current_port() {
+  local listen_value
+  listen_value="$(config_value listen)"
+  printf '%s\n' "$listen_value" |
+    grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}|\[[^]]+\]:[0-9]{1,5}' |
+    sed -n '1 { s/.*://; p; }'
+}
+
+public_ip() {
+  local ip=""
+  if command -v curl >/dev/null 2>&1; then
+    ip="$(curl -4 -fsS --connect-timeout 3 --max-time 6 https://ifconfig.me/ip 2>/dev/null || true)"
+  fi
+  if [[ ! "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    ip="<VPS公网IP>"
+  fi
+  printf '%s\n' "$ip"
+}
+
+generate_psk() {
+  od -An -N16 -tx1 /dev/urandom | tr -d ' \n'
+  printf '\n'
+}
+
+port_is_free() {
+  local port="$1"
+  local listeners
+  listeners="$(ss -H -ltn)" || die "无法检查监听端口。"
+  ! printf '%s\n' "$listeners" | awk '{ print $4 }' |
+    grep -Eq "(^|:|\\])${port}$"
+}
+
+port_is_listening() {
+  local port="$1" pid
+  pid="$(systemctl show "$SERVICE_NAME" -p MainPID --value)" || return 1
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  ss -H -ltnp | awk -v port="$port" -v pid="$pid" '
+    $4 ~ (":" port "$") && index($0, "pid=" pid ",") { found=1 }
+    END { exit !found }
+  '
+}
+
+wait_for_port() {
+  local port="$1"
+  local attempt
+  for attempt in $(seq 1 10); do
+    if port_is_listening "$port"; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+
+generate_port() {
+  local port
+  local attempt
+  for attempt in $(seq 1 200); do
+    port="$((20000 + (10#$(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 40001)))"
+    if port_is_free "$port"; then
+      printf '%s\n' "$port"
+      return 0
+    fi
+  done
+  return 1
+}
+
+backup_config() {
+  local stamp
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  LAST_BACKUP="$(mktemp "${CONFIG_PATH}.bak.${stamp}.XXXXXX")" || die "无法创建配置备份。"
+  cp -a -- "$CONFIG_PATH" "$LAST_BACKUP" || die "配置备份失败，未修改配置。"
+  info "配置已备份：${LAST_BACKUP}"
+}
+
+restore_backup() {
+  [[ -n "$LAST_BACKUP" && -f "$LAST_BACKUP" ]] || return 1
+  cp -a -- "$LAST_BACKUP" "$CONFIG_PATH" || return 1
+  chown root:snell "$CONFIG_PATH" || return 1
+  chmod 0640 "$CONFIG_PATH" || return 1
+}
+
+replace_config_key() {
+  local key="$1"
+  local value="$2"
+  local tmp
+  tmp="$(mktemp "${CONFIG_PATH}.tmp.XXXXXX")" || die "无法创建临时配置。"
+
+  awk -v wanted="$key" -v replacement="$value" '
+    BEGIN { changed = 0 }
+    {
+      line = $0
+      trimmed = line
+      sub(/^[[:space:]]*/, "", trimmed)
+      if (!changed && index(trimmed, wanted) == 1) {
+        rest = substr(trimmed, length(wanted) + 1)
+        if (rest ~ /^[[:space:]]*=/) {
+          print wanted " = " replacement
+          changed = 1
+          next
+        }
+      }
+      print line
+    }
+    END {
+      if (!changed) {
+        print wanted " = " replacement
+      }
+    }
+  ' "$CONFIG_PATH" > "$tmp" || die "生成新配置失败，原配置未替换。"
+
+  chown root:snell "$tmp" || die "设置配置所有者失败。"
+  chmod 0640 "$tmp" || die "设置配置权限失败。"
+  mv -f -- "$tmp" "$CONFIG_PATH" || die "替换配置失败。"
+}
+
+replace_listen_port() {
+  local old_port="$1"
+  local new_port="$2"
+  local listen_value
+  listen_value="$(config_value listen)"
+  [[ -n "$listen_value" ]] || die "无法读取 listen 配置。"
+
+  listen_value="$(
+    printf '%s\n' "$listen_value" |
+      sed -E "s/:${old_port}([,[:space:]]|$)/:${new_port}\\1/g"
+  )"
+  replace_config_key "listen" "$listen_value"
+}
+
+firewall_backend() {
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    printf 'ufw\n'
+  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    printf 'firewalld\n'
+  else
+    printf 'none\n'
+  fi
+}
+
+firewall_allow() {
+  local port="$1"
+  case "$(firewall_backend)" in
+    ufw)
+      ufw allow "${port}/tcp" comment 'Snell v6' >/dev/null
+      ;;
+    firewalld)
+      firewall-cmd --add-port="${port}/tcp" >/dev/null || return 1
+      firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null
+      ;;
+    none)
+      warn "未检测到已启用的 UFW/firewalld，请确认服务商防火墙已放行 TCP ${port}。"
+      ;;
+  esac
+}
+
+firewall_delete() {
+  local port="$1"
+  case "$(firewall_backend)" in
+    ufw)
+      ufw --force delete allow "${port}/tcp" >/dev/null 2>&1 || true
+      ;;
+    firewalld)
+      firewall-cmd --remove-port="${port}/tcp" >/dev/null 2>&1 || true
+      firewall-cmd --permanent --remove-port="${port}/tcp" >/dev/null 2>&1 || true
+      ;;
+  esac
+}
+
+restart_with_rollback() {
+  local description="$1"
+  if systemctl restart "$SERVICE_NAME" && sleep 2 && systemctl is-active --quiet "$SERVICE_NAME" && wait_for_port "$(current_port)"; then
+    ok "${description}成功，Snell 已正常运行。"
+    return 0
+  fi
+
+  warn "${description}后服务启动失败，正在恢复上一份配置。"
+  restore_backup || die "自动回滚失败，请从备份手动恢复：${LAST_BACKUP}"
+  systemctl restart "$SERVICE_NAME" || true
+  { systemctl is-active --quiet "$SERVICE_NAME" && wait_for_port "$(current_port)"; } ||
+    die "已恢复配置，但服务仍未启动。请运行：journalctl -u ${SERVICE_NAME} -n 80 --no-pager"
+  die "新配置不可用，已自动回滚。"
+}
+
+show_status() {
+  local port
+  local release="unknown"
+  local service_state
+  local timer_state
+  port="$(current_port || true)"
+  [[ -f "$RELEASE_STATE" ]] && release="$(<"$RELEASE_STATE")"
+  service_state="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)"
+  timer_state="$(systemctl is-active "$TIMER_NAME" 2>/dev/null || true)"
+
+  printf '%sSnell v6 状态%s\n' "$C_BOLD" "$C_RESET"
+  printf '  版本：%s\n' "$release"
+  printf '  服务：%s\n' "$service_state"
+  printf '  端口：%s\n' "${port:-unknown}"
+  printf '  自动升级：%s\n' "$timer_state"
+  printf '  配置：%s\n' "$CONFIG_PATH"
+  if [[ -n "$port" ]]; then
+    printf '  监听：\n'
+    ss -ltnp 2>/dev/null | awk -v port="$port" '$4 ~ (":" port "$") { print "    " $0 }'
+  fi
+}
+
+show_connection() {
+  warn "下方包含 PSK，请勿截图或公开转发。"
+  if [[ -x "$MANAGER_PATH" ]]; then
+    "$MANAGER_PATH" show
+    return
+  fi
+
+  local ip
+  local port
+  local psk
+  ip="$(public_ip)"
+  port="$(current_port)"
+  psk="$(config_value psk)"
+  printf '服务器：%s\n端口：%s\nPSK：%s\n' "$ip" "$port" "$psk"
+  printf 'Surge：Snell-v6 = snell, %s, %s, psk=%s, version=6\n' "$ip" "$port" "$psk"
+}
+
+update_snell() {
+  local port
+  [[ -x "$MANAGER_PATH" ]] || die "未找到 ${MANAGER_PATH}，无法安全更新。"
+  info "正在检查官方 Snell v6 更新……"
+  "$MANAGER_PATH" update || die "更新失败，查看上方错误。"
+  port="$(current_port)"
+  systemctl is-active --quiet "$SERVICE_NAME" || die "更新后 Snell 服务未运行。"
+  wait_for_port "$port" || die "更新后服务未监听 TCP ${port}。"
+  ok "更新检查完成。"
+}
+
+restart_snell() {
+  local port
+  port="$(current_port)"
+  acquire_lock
+  systemctl restart "$SERVICE_NAME" || die "Snell 重启失败。"
+  sleep 2
+  systemctl is-active --quiet "$SERVICE_NAME" || die "重启失败，请查看日志。"
+  wait_for_port "$port" || die "重启后服务未监听 TCP ${port}。"
+  release_lock
+  ok "Snell 已重启。"
+}
+
+change_psk() {
+  local choice=""
+  local new_psk=""
+  local confirm_psk=""
+
+  printf '\n1) 自动生成安全 PSK\n2) 手动输入 PSK\n0) 取消\n'
+  read -r -p "请选择 [1]: " choice
+  choice="${choice:-1}"
+  case "$choice" in
+    1)
+      new_psk="$(generate_psk)"
+      ;;
+    2)
+      read -r -s -p "输入新 PSK（12–255 位字母、数字或 ._~+-）: " new_psk
+      printf '\n'
+      read -r -s -p "再次输入新 PSK: " confirm_psk
+      printf '\n'
+      [[ "$new_psk" == "$confirm_psk" ]] || die "两次输入不一致。"
+      ;;
+    0)
+      info "已取消。"
+      return 0
+      ;;
+    *)
+      die "无效选择。"
+      ;;
+  esac
+
+  [[ ${#new_psk} -ge 12 && ${#new_psk} -le 255 ]] || die "PSK 长度必须为 12–255 字符。"
+  [[ "$new_psk" =~ ^[A-Za-z0-9._~+-]+$ ]] ||
+    die "PSK 只能包含字母、数字或 . _ ~ + -。"
+
+  warn "修改 PSK 后，所有客户端都必须同步更新。"
+  confirm "确认修改 PSK？" || {
+    info "已取消。"
+    return 0
+  }
+
+  acquire_lock
+  backup_config
+  replace_config_key "psk" "$new_psk"
+  restart_with_rollback "修改 PSK"
+  release_lock
+  show_connection
+}
+
+change_port() {
+  local old_port
+  local new_port=""
+  local backend
+  old_port="$(current_port)"
+
+  read -r -p "输入新端口（留空自动生成，当前 ${old_port}）: " new_port
+  if [[ -z "$new_port" ]]; then
+    new_port="$(generate_port)" || die "无法自动找到空闲端口。"
+    info "已选择空闲端口：${new_port}"
+  fi
+
+  [[ "$new_port" =~ ^[0-9]+$ ]] || die "端口必须是数字。"
+  (( new_port >= 1024 && new_port <= 65535 )) || die "端口范围必须是 1024–65535。"
+  [[ "$new_port" != "$old_port" ]] || {
+    info "新旧端口相同，无需修改。"
+    return 0
+  }
+  port_is_free "$new_port" || die "端口 ${new_port} 已被占用。"
+
+  warn "修改端口后，所有客户端和服务商防火墙都必须同步更新。"
+  confirm "确认把端口从 ${old_port} 改为 ${new_port}？" || {
+    info "已取消。"
+    return 0
+  }
+
+  acquire_lock
+  backup_config
+  backend="$(firewall_backend)"
+  firewall_allow "$new_port" || die "防火墙放行失败，未修改 Snell 配置。"
+  replace_listen_port "$old_port" "$new_port"
+
+  if ! systemctl restart "$SERVICE_NAME" ||
+    ! systemctl is-active --quiet "$SERVICE_NAME" ||
+    ! wait_for_port "$new_port"; then
+    warn "新端口启动失败，正在回滚。"
+    restore_backup || die "自动回滚失败，请从备份恢复：${LAST_BACKUP}"
+    systemctl restart "$SERVICE_NAME" || true
+    [[ "$backend" == "none" ]] || warn "新端口防火墙规则已保留，请确认是否需要手动删除。"
+    die "端口修改失败，已恢复旧配置。"
+  fi
+
+  install -d -o root -g root -m 0755 "$STATE_DIR"
+  printf '%s\n' "$new_port" > "$PORT_STATE"
+  chmod 0644 "$PORT_STATE"
+  # Keep the old allow rule: it may predate this tool or be shared by another service.
+  [[ "$backend" == "none" ]] || warn "旧端口的放行规则已保留，确认无其他用途后可手动删除。"
+  release_lock
+  ok "端口已从 ${old_port} 修改为 ${new_port}。"
+  show_connection
+}
+
+show_logs() {
+  journalctl -u "$SERVICE_NAME" -n 80 --no-pager
+}
+
+toggle_timer() {
+  acquire_lock
+  if systemctl is-active --quiet "$TIMER_NAME"; then
+    warn "自动升级当前已启用。"
+    confirm "确认关闭每日自动升级检查？" || {
+      info "已取消。"
+      release_lock
+      return 0
+    }
+    systemctl disable --now "$TIMER_NAME" || die "关闭自动升级失败。"
+    ok "自动升级已关闭。"
+  else
+    systemctl enable --now "$TIMER_NAME" || die "开启自动升级失败。"
+    ok "自动升级已启用。"
+    systemctl list-timers "$TIMER_NAME" --no-pager || true
+  fi
+  release_lock
+}
+
+network_command() {
+  [[ -x "$NETWORK_TOOL" ]] || die "未安装网络模块，请先运行 snell-auto.sh。"
+  "$NETWORK_TOOL" "$@"
+}
+
+optimize_network() {
+  network_command apply || return 1
+  info "网络参数已检查。已有连接可能继续使用旧参数；新连接生效，必要时选择重启 Snell。"
+}
+
+security_command() {
+  [[ -x "$SECURITY_TOOL" ]] || die "未安装安全模块，请重新运行新版 snell-auto.sh。"
+  "$SECURITY_TOOL" "$@"
+}
+
+health_check() {
+  local port
+  local failed=0
+  port="$(current_port || true)"
+
+  printf '%sSnell v6 健康检查%s\n' "$C_BOLD" "$C_RESET"
+  if systemctl is-active --quiet "$SERVICE_NAME"; then
+    ok "服务运行中"
+  else
+    warn "服务未运行"
+    failed=1
+  fi
+
+  if [[ -n "$port" ]] && port_is_listening "$port"; then
+    ok "TCP ${port} 正在监听"
+  else
+    warn "未检测到 Snell 监听端口"
+    failed=1
+  fi
+
+  if systemctl is-active --quiet "$TIMER_NAME"; then
+    ok "自动升级定时器运行中"
+  else
+    warn "自动升级定时器未运行"
+  fi
+
+  if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
+    if ufw status | grep -Eq "^${port}/tcp[[:space:]]+ALLOW"; then
+      ok "UFW 已放行 TCP ${port}"
+    else
+      warn "UFW 未发现 TCP ${port} 放行规则"
+      failed=1
+    fi
+  fi
+
+  if [[ "$failed" -eq 0 ]]; then
+    ok "检查通过。"
+  else
+    return 1
+  fi
+}
+
+print_menu() {
+  clear 2>/dev/null || true
+  printf '%s\n' "${C_BOLD}Snell v6 管理工具（snellx）${C_RESET}"
+  printf '%s\n' "──────────────────────────────"
+  printf '  1) 查看运行状态\n'
+  printf '  2) 查看连接配置（含 PSK）\n'
+  printf '  3) 检查并更新 Snell\n'
+  printf '  4) 重启 Snell\n'
+  printf '  5) 修改/随机生成 PSK\n'
+  printf '  6) 修改/随机生成端口\n'
+  printf '  7) 查看最近日志\n'
+  printf '  8) 开启/关闭自动升级\n'
+  printf '  9) 一键健康检查\n'
+  printf '  10) 检测系统与网络环境\n'
+  printf '  11) 应用自适应网络参数\n'
+  printf '  12) 回滚本工具的网络参数\n'
+  printf '  13) 查看安全加固状态\n'
+  printf '  14) 应用基础安全加固\n'
+  printf '  15) 回滚本工具的安全配置\n'
+  printf '  0) 退出\n'
+  printf '%s\n' "──────────────────────────────"
+}
+
+interactive_menu() {
+  local choice
+  while true; do
+    print_menu
+    read -r -p "请选择 [0-15]: " choice || return 0
+    printf '\n'
+    case "$choice" in
+      1) show_status || true ;;
+      2) show_connection || true ;;
+      3) update_snell || true ;;
+      4) restart_snell || true ;;
+      5) change_psk || true ;;
+      6) change_port || true ;;
+      7) show_logs || true ;;
+      8) toggle_timer || true ;;
+      9) health_check || true ;;
+      10) network_command diagnose || true ;;
+      11) optimize_network || true ;;
+      12) network_command rollback || true ;;
+      13) security_command status || true ;;
+      14) security_command apply || true ;;
+      15) security_command rollback || true ;;
+      0) printf '再见。\n'; return 0 ;;
+      *) warn "无效选择：${choice}" ;;
+    esac
+    pause_screen
+  done
+}
+
+usage() {
+  cat <<'EOF'
+用法：
+  snellx                 打开交互式菜单
+  snellx status          查看状态
+  snellx show            显示连接配置（包含 PSK）
+  snellx update          检查并更新 Snell
+  snellx restart         重启服务
+  snellx psk             修改/生成 PSK
+  snellx port            修改/生成端口
+  snellx logs            查看最近日志
+  snellx timer           开启/关闭自动升级
+  snellx check           一键健康检查
+  snellx diagnose        检测系统/网络（可追加 --probe IP）
+  snellx optimize        应用保守的自适应网络参数
+  snellx rollback-network 恢复本工具首次优化前的参数
+  snellx security [--no-packages] 应用基础安全加固
+  snellx security-status 查看安全加固状态
+  snellx rollback-security 回滚本工具的安全配置
+EOF
+}
+
+main() {
+  require_root
+  require_systemd
+  require_installation
+
+  case "${1:-menu}" in
+    menu) interactive_menu ;;
+    status) show_status ;;
+    show) show_connection ;;
+    update) update_snell ;;
+    restart) restart_snell ;;
+    psk) change_psk ;;
+    port) change_port ;;
+    logs) show_logs ;;
+    timer) toggle_timer ;;
+    check) health_check ;;
+    diagnose) shift; network_command diagnose "$@" ;;
+    optimize) optimize_network ;;
+    rollback-network) network_command rollback ;;
+    security) shift; security_command apply "$@" ;;
+    security-status) shift; security_command status "$@" ;;
+    rollback-security) shift; security_command rollback "$@" ;;
+    -h|--help|help) usage ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
