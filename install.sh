@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Release bootstrap. Generated install.sh pins a release and its bundle digest.
-# This template is not a runnable release until its three placeholders are set.
+# Generated from scripts/snell-release-install.sh by scripts/render-release-installer.py; do not edit.
 
 snell_release_usage() {
   cat <<'USAGE'
@@ -13,6 +13,9 @@ Snell 一键安装入口（固定发行版 + SHA-256 校验）
   sudo bash install.sh security                单独应用安全加固
   sudo bash install.sh security-status         查看安全加固状态
   sudo bash install.sh rollback-security       回滚本工具的安全配置
+  sudo bash install.sh install --no-auto-update 禁用 Snell 自动升级
+  sudo bash install.sh install --auto-update-channel prerelease
+                                               自动升级也安装 beta/rc（默认只装正式版）
   bash install.sh --help                       显示帮助，不联网
 
 仅支持 Linux VPS。下载的安装包通过固定 SHA-256 与 Bash 语法检查后才运行。
@@ -27,8 +30,8 @@ snell_release_main() (
   set -uo pipefail
   umask 077
   local repository='nuvora-f44c84/SnellX'
-  local release_tag='v1.0.0'
-  local expected_sha256='eededdc91cfc98ce8deb243a23d405bb2242f32a4bef9e4ff77b8a43fbfb004f'
+  local release_tag='v1.1.0'
+  local expected_sha256='2b4cecffa9f9414d1c7c41fc2d92132de6610f032193c41646b37320fdb48743'
   local release_tmp='' payload='' checksum='' actual_sha256='' argument
 
   snell_release_error() { printf '[snell-auto] 错误：%s\n' "$*" >&2; }

@@ -25,6 +25,7 @@ readonly HASH_STATE="${STATE_DIR}/sha256"
 readonly PORT_STATE="${STATE_DIR}/port"
 readonly FIREWALL_STATE="${STATE_DIR}/firewall"
 readonly OWNER_STATE="${STATE_DIR}/managed-by"
+readonly CHANNEL_STATE="${STATE_DIR}/auto-update-channel"
 readonly SERVICE_UNIT="/etc/systemd/system/snell-server.service"
 readonly UPDATE_SERVICE_UNIT="/etc/systemd/system/snell-update.service"
 readonly UPDATE_TIMER_UNIT="/etc/systemd/system/snell-update.timer"
@@ -32,11 +33,15 @@ readonly SERVICE_NAME="snell-server.service"
 readonly TIMER_NAME="snell-update.timer"
 readonly LOCK_FILE="/run/lock/snell-manager.lock"
 readonly SERVICE_MARKER="Managed by snell-v6.sh"
+readonly BACKUP_KEEP=5
 
 QUIET=0
 TMP_DIR=""
 LOCK_HELD=0
 AUTO_UPDATE="preserve"
+AUTO_CHANNEL=""
+UPDATE_MODE="manual"
+LAST_BINARY_BACKUP=""
 
 log() {
   if [[ "$QUIET" -eq 0 ]]; then
@@ -73,7 +78,7 @@ require_linux_systemd() {
   if command -v getconf >/dev/null 2>&1; then
     getconf GNU_LIBC_VERSION >/dev/null 2>&1 ||
       die "官方 Snell 二进制依赖 glibc，不支持 Alpine/musl。请改用 Debian、Ubuntu、RHEL 等 glibc 系统。"
-  elif command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
+  elif command -v ldd >/dev/null 2>&1 && grep -qi musl <<< "$(ldd --version 2>&1)"; then
     die "官方 Snell 二进制依赖 glibc，不支持 Alpine/musl。请改用 Debian、Ubuntu、RHEL 等 glibc 系统。"
   fi
 }
@@ -88,7 +93,9 @@ acquire_lock() {
 install_dependencies() {
   local missing=0
   local cmd
-  for cmd in curl unzip sha256sum awk sed grep od ip ss tc sysctl flock timeout getent useradd groupadd; do
+  # tc is optional (diagnostics only); on RHEL 8+ it lives in iproute-tc, so
+  # requiring it here would re-run the package manager on every update.
+  for cmd in curl unzip sha256sum awk sed grep od ip ss sysctl flock timeout getent useradd groupadd; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
       missing=1
       break
@@ -99,8 +106,9 @@ install_dependencies() {
   log "安装必要依赖……"
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    apt-get install -y -qq curl unzip ca-certificates coreutils gawk iproute2 procps util-linux passwd kmod
+    # A fresh VPS often has unattended-upgrades/cloud-init holding the dpkg lock.
+    apt-get -o DPkg::Lock::Timeout=180 update -qq
+    apt-get -o DPkg::Lock::Timeout=180 install -y -qq curl unzip ca-certificates coreutils gawk iproute2 procps util-linux passwd kmod
   elif command -v dnf >/dev/null 2>&1; then
     dnf install -y curl unzip ca-certificates coreutils gawk iproute procps-ng util-linux shadow-utils kmod
   elif command -v yum >/dev/null 2>&1; then
@@ -140,18 +148,21 @@ version_key() {
   printf '6.%06d.%06d.%d.%06d\n' "$((10#$minor))" "$((10#$patch))" "$rank" "$((10#$suffix))"
 }
 
+is_prerelease_key() { [[ "$1" != *.3.000000 ]]; }
+
 select_release_url() {
-  local asset_arch="$1" url tag key
+  local asset_arch="$1" channel="${2:-any}" url tag key
   while IFS= read -r url; do
     tag="${url##*/snell-server-}"; tag="${tag%-linux-*}"
     key="$(version_key "$tag")" || continue
+    if [[ "$channel" == stable ]] && is_prerelease_key "$key"; then continue; fi
     printf '%s\t%s\n' "$key" "$url"
   done < <(grep -Eo 'https://[^[:space:]"<>`)]+' | grep -E "^https://dl\\.nssurge\\.com/snell/snell-server-v6\\.[0-9]+\\.[0-9]+((beta|rc)[0-9]*)?-linux-${asset_arch}\\.zip$") |
     LC_ALL=C sort -ru | awk 'NR == 1 { print $2 }'
 }
 
 fetch_release_url() {
-  local asset_arch="$1"
+  local asset_arch="$1" channel="${2:-any}"
   local page
   local url
 
@@ -163,9 +174,10 @@ fetch_release_url() {
 
   url="$(
     printf '%s\n' "$page" |
-      select_release_url "$asset_arch"
+      select_release_url "$asset_arch" "$channel"
   )"
 
+  if [[ -z "$url" && "$channel" == stable ]]; then return 2; fi
   [[ -n "$url" ]] || die "官方页面未找到适用于 ${asset_arch} 的 Snell v6 下载地址。"
   [[ "$url" == "${DOWNLOAD_PREFIX}"* ]] || die "发布地址未通过域名白名单校验。"
   printf '%s\n' "$url"
@@ -189,8 +201,8 @@ download_and_verify_binary() {
   local version_output
 
   log "下载官方 Snell v6：${url##*/}"
-  curl -fsS \
-    --proto '=https' --tlsv1.2 \
+  curl -fsS --location --max-redirs 5 \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 \
     --retry 3 --retry-delay 2 \
     --connect-timeout 10 --max-time 180 \
     -o "$archive" "$url" || die "下载 Snell v6 失败。"
@@ -213,20 +225,37 @@ download_and_verify_binary() {
 
   unzip -p "$archive" "$member" > "${TMP_DIR}/snell-server"
   chmod 0755 "${TMP_DIR}/snell-server"
+  elf_matches_arch "${TMP_DIR}/snell-server" "$expected_arch" ||
+    die "下载的文件不是 ${expected_arch} 架构的 Linux ELF 程序。"
 
-  version_output="$(timeout 10 "${TMP_DIR}/snell-server" --version 2>&1)" ||
+  version_output="$(run_unprivileged "${TMP_DIR}/snell-server" --version 2>&1)" ||
     die "下载的 Snell 二进制无法在当前系统执行。"
   printf '%s\n' "$version_output" | grep -Eq 'snell-server v6\.' ||
     die "下载的文件不是 Snell v6 二进制。"
+}
 
-  case "$expected_arch" in
-    amd64)
-      printf '%s\n' "$version_output" >/dev/null
-      ;;
-    i386|aarch64)
-      printf '%s\n' "$version_output" >/dev/null
-      ;;
-  esac
+# Check the ELF magic and e_machine (little-endian u16 at offset 18) before
+# executing anything: x86-64=62, i386=3, aarch64=183.
+elf_matches_arch() {
+  local file="$1" arch="$2" magic low high machine expected
+  magic="$(od -An -N4 -tx1 "$file" 2>/dev/null | tr -d ' \n')" || return 1
+  [[ "$magic" == 7f454c46 ]] || return 1
+  IFS=" " read -r low high < <(od -An -j18 -N2 -tu1 "$file" 2>/dev/null) || return 1
+  [[ "$low" =~ ^[0-9]+$ && "$high" =~ ^[0-9]+$ ]] || return 1
+  machine=$((low + 256 * high))
+  case "$arch" in amd64) expected=62 ;; i386) expected=3 ;; aarch64) expected=183 ;; *) return 1 ;; esac
+  [[ "$machine" == "$expected" ]]
+}
+
+# Run a freshly downloaded program as the unprivileged service account when
+# possible, so a bad download never gets root just to print its version.
+run_unprivileged() {
+  if command -v setpriv >/dev/null 2>&1 && id -u snell >/dev/null 2>&1; then
+    chmod 0711 "$TMP_DIR" || return 1
+    timeout 10 setpriv --reuid=snell --regid=snell --clear-groups --no-new-privs -- "$@"
+  else
+    timeout 10 "$@"
+  fi
 }
 
 atomic_install_binary() {
@@ -301,6 +330,28 @@ service_listening() {
   '
 }
 
+auto_update_channel() {
+  local channel="stable"
+  if [[ -s "$CHANNEL_STATE" ]]; then channel="$(<"$CHANNEL_STATE")"; fi
+  case "$channel" in stable|prerelease) printf '%s\n' "$channel" ;; *) printf 'stable\n' ;; esac
+}
+
+# Keep only the newest backups; never touch paths outside our backup directory.
+prune_backups() {
+  local directory="$1" pattern="$2" keep="${3:-$BACKUP_KEEP}" old
+  [[ -d "$directory" && ! -L "$directory" ]] || return 0
+  while IFS= read -r old; do
+    [[ -n "$old" && "$old" == "$directory/"* && ! -L "$old" ]] || continue
+    rm -rf -- "$old"
+  # Names embed a YYYYmmdd-HHMMSS stamp, so name order is creation order
+  # (mtime is not: cp -a keeps the source file's time).
+  done < <(find "$directory" -mindepth 1 -maxdepth 1 -name "$pattern" -printf '%f\t%p\n' 2>/dev/null |
+    LC_ALL=C sort -r | awk -F '\t' -v keep="$keep" 'NR > keep { print $2 }')
+}
+
+# restart_service=yes restarts and verifies, rolling back on failure.
+# restart_service=no only installs the binary; LAST_BINARY_BACKUP lets the
+# caller roll back after its own restart.
 perform_update() {
   local restart_service="${1:-yes}"
   local asset_arch
@@ -309,11 +360,22 @@ perform_update() {
   local new_hash
   local current_hash=""
   local backup_binary=""
-  local current_tag="" remote_key current_key backup_dir
+  local current_tag="" remote_key current_key backup_dir="" channel=any status=0
 
+  LAST_BINARY_BACKUP=""
   TMP_DIR="$(mktemp -d /tmp/snell-update.XXXXXX)"
   asset_arch="$(detect_asset_arch)"
-  release_url="$(fetch_release_url "$asset_arch")"
+  # Unattended updates follow the configured channel (stable by default):
+  # Snell prereleases have changed the protocol before and need a client update.
+  if [[ "$UPDATE_MODE" == auto ]]; then
+    [[ "$(auto_update_channel)" == prerelease ]] || channel=stable
+  fi
+  release_url="$(fetch_release_url "$asset_arch" "$channel")" || status=$?
+  if [[ "$status" -eq 2 ]]; then
+    log "自动更新只安装正式版：官方页面暂无 v6 正式版，保留当前程序。预发布版请手动运行 snellx update。"
+    return 0
+  fi
+  [[ "$status" -eq 0 ]] || die "无法获取官方下载地址。"
   remote_tag="$(release_tag_from_url "$release_url")"
   remote_key="$(version_key "$remote_tag")" || die "无法比较官方版本。"
   if [[ -x "$BIN_PATH" ]]; then
@@ -366,7 +428,20 @@ perform_update() {
   fi
 
   record_release_state "$remote_tag" "$new_hash"
+  LAST_BINARY_BACKUP="$backup_binary"
+  if [[ -n "$backup_dir" ]]; then prune_backups "${STATE_DIR}/backups" 'update-*' || true; fi
   log "Snell 已升级到官方版本：${remote_tag}"
+}
+
+# Used by install when the new binary only fails after the units are rewritten.
+restore_previous_binary() {
+  local backup="$LAST_BINARY_BACKUP" backup_dir
+  [[ -n "$backup" && -x "$backup" ]] || return 1
+  backup_dir="$(dirname "$backup")"
+  atomic_install_binary "$backup" || return 1
+  if [[ -f "${backup_dir}/release" ]]; then cp -a "${backup_dir}/release" "$RELEASE_STATE"; fi
+  if [[ -f "${backup_dir}/sha256" ]]; then cp -a "${backup_dir}/sha256" "$HASH_STATE"; fi
+  restart_and_verify_service
 }
 
 create_service_user() {
@@ -396,19 +471,32 @@ port_in_use() {
   ' /proc/net/tcp /proc/net/tcp6 2>/dev/null
 }
 
+# Print the kernel's ephemeral (outbound) port range as "low high".
+ephemeral_port_range() {
+  local low=0 high=0
+  if [[ -r /proc/sys/net/ipv4/ip_local_port_range ]]; then
+    IFS=$' \t' read -r low high < /proc/sys/net/ipv4/ip_local_port_range || true
+  fi
+  [[ "$low" =~ ^[0-9]+$ && "$high" =~ ^[0-9]+$ ]] || { low=0; high=0; }
+  printf '%s %s\n' "$low" "$high"
+}
+
+# Random free port in 10000-65000, outside the ephemeral range so an outbound
+# connection cannot grab it while Snell restarts.
 generate_port() {
-  local attempt
-  local raw
-  local port
-  for ((attempt = 0; attempt < 200; attempt++)); do
+  local attempt raw port low high avoid=1
+  IFS=' ' read -r low high < <(ephemeral_port_range)
+  if (( low <= 10000 && high >= 65000 )); then avoid=0; fi
+  for ((attempt = 0; attempt < 400; attempt++)); do
     raw="$(od -An -N2 -tu2 /dev/urandom | tr -d ' ')"
-    port=$((10000 + raw % 50001))
+    port=$((10000 + raw % 55001))
+    if (( avoid && port >= low && port <= high )); then continue; fi
     if ! port_in_use "$port"; then
       printf '%s\n' "$port"
       return 0
     fi
   done
-  die "尝试 200 次后仍无法找到空闲端口。"
+  die "尝试 400 次后仍无法找到空闲端口。"
 }
 
 generate_psk() {
@@ -419,7 +507,7 @@ generate_psk() {
 ipv6_available() {
   [[ -s /proc/net/if_inet6 ]] &&
     [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || printf '1')" == "0" ]] &&
-    ip -6 addr show scope global | grep -q 'inet6 ' &&
+    [[ "$(ip -6 addr show scope global 2>/dev/null)" == *'inet6 '* ]] &&
     [[ -n "$(ip -6 route show default)" ]]
 }
 
@@ -549,7 +637,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/snell-manager update --quiet
+ExecStart=/usr/local/sbin/snell-manager update --quiet --auto
 EOF
 
   cat > "$UPDATE_TIMER_UNIT" <<'EOF'
@@ -592,7 +680,8 @@ install_manager_copy() {
 
 open_firewall() {
   local port="$1"
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+  # Capture first: with pipefail, "ufw status | grep -q" can fail via SIGPIPE.
+  if command -v ufw >/dev/null 2>&1 && grep -q '^Status: active' <<< "$(ufw status 2>/dev/null)"; then
     ufw allow "${port}/tcp" comment 'Snell v6' >/dev/null
     printf 'ufw\n' > "$FIREWALL_STATE"
     log "已放行 UFW TCP 端口 ${port}。"
@@ -679,12 +768,20 @@ install_snell() {
   create_service_user
   ensure_config
   install_manager_copy
-  if [[ "$was_installed" -eq 1 ]]; then perform_update yes; else perform_update no; fi
+  # Install the binary without restarting; the single restart below covers
+  # both a new binary and rewritten units, so clients are interrupted once.
+  perform_update no
   write_service_units
+  record_channel
 
   systemctl enable "$SERVICE_NAME"
   if ! restart_and_verify_service; then
     journalctl -u "$SERVICE_NAME" -n 40 --no-pager >&2 || true
+    if [[ -n "$LAST_BINARY_BACKUP" ]]; then
+      warn "新版本启动失败，正在恢复旧版本。"
+      restore_previous_binary || die "恢复旧版本后服务仍异常，请查看 journalctl -u ${SERVICE_NAME}。"
+      die "新版本无法启动，已恢复旧版本并重新运行。"
+    fi
     die "Snell 服务未能启动，请查看上方日志。"
   fi
   case "$AUTO_UPDATE" in
@@ -710,6 +807,24 @@ update_snell() {
   perform_update yes
 }
 
+record_channel() {
+  [[ -n "$AUTO_CHANNEL" ]] || return 0
+  install -d -o root -g root -m 0755 "$STATE_DIR"
+  printf '%s\n' "$AUTO_CHANNEL" > "$CHANNEL_STATE"
+  chmod 0644 "$CHANNEL_STATE"
+}
+
+channel_snell() {
+  require_root
+  if [[ -n "$AUTO_CHANNEL" ]]; then
+    acquire_lock
+    record_channel
+    log "自动更新通道已设为：${AUTO_CHANNEL}"
+  else
+    printf '自动更新通道：%s（stable=只自动安装正式版；prerelease=也自动安装 beta/rc）\n' "$(auto_update_channel)"
+  fi
+}
+
 status_snell() {
   require_root
   local release="unknown"
@@ -718,6 +833,7 @@ status_snell() {
   printf '服务状态：%s\n' "$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)"
   printf '开机启动：%s\n' "$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || true)"
   printf '自动升级：%s\n' "$(systemctl is-active "$TIMER_NAME" 2>/dev/null || true)"
+  printf '自动升级通道：%s\n' "$(auto_update_channel)"
   printf '定时计划：\n'
   systemctl list-timers "$TIMER_NAME" --no-pager 2>/dev/null || true
 }
@@ -759,6 +875,7 @@ Snell v6 一键管理脚本
   sudo snell-manager update           立即检查并安装官方 v6 更新
   sudo snell-manager show             显示 Surge 连接配置（包含 PSK）
   sudo snell-manager status           显示服务与自动升级状态
+  sudo snell-manager channel [stable|prerelease] 查看/设置自动更新通道
   sudo snell-manager uninstall        卸载程序，保留配置和 PSK
   sudo snell-manager uninstall --purge 卸载并清除配置、PSK 和状态
 
@@ -766,6 +883,10 @@ Snell v6 一键管理脚本
   --quiet   减少普通输出，供 systemd 自动升级使用
   --no-auto-update 安装后禁用自动升级
   --auto-update    安装后启用自动升级（默认保留已有开关，新装启用）
+  --auto-update-channel stable|prerelease
+                   自动升级通道；默认 stable（只自动安装正式版）。
+                   手动 update 总是安装官方最新版（含 beta/rc）。
+  --auto    由定时任务使用：按自动升级通道选择版本
   -h        显示帮助
 EOF
 }
@@ -785,6 +906,17 @@ main() {
         ;;
       --no-auto-update) AUTO_UPDATE="off" ;;
       --auto-update) AUTO_UPDATE="on" ;;
+      --auto) UPDATE_MODE="auto" ;;
+      --auto-update-channel)
+        [[ $# -ge 2 ]] || die "--auto-update-channel 需要 stable 或 prerelease。"
+        AUTO_CHANNEL="$2"; shift
+        [[ "$AUTO_CHANNEL" == stable || "$AUTO_CHANNEL" == prerelease ]] ||
+          die "--auto-update-channel 需要 stable 或 prerelease。"
+        ;;
+      stable|prerelease)
+        [[ "$command" == channel ]] || die "未知参数：$1"
+        AUTO_CHANNEL="$1"
+        ;;
       -h|--help)
         usage
         exit 0
@@ -809,6 +941,9 @@ main() {
       ;;
     status)
       status_snell
+      ;;
+    channel)
+      channel_snell
       ;;
     uninstall)
       uninstall_snell "$purge"

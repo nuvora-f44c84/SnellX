@@ -7,7 +7,7 @@
 #
 # Usage:
 #   snellx
-#   snellx status|show|update|restart|psk|port|logs|timer|check
+#   snellx status|show|update|restart|psk|port|logs|timer|channel|check|uninstall
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -23,6 +23,10 @@ readonly TIMER_NAME="snell-update.timer"
 readonly LOCK_FILE="/run/lock/snell-manager.lock"
 readonly NETWORK_TOOL="/usr/local/sbin/snell-net"
 readonly SECURITY_TOOL="/usr/local/sbin/snell-security"
+readonly AUTO_TOOL="/usr/local/sbin/snell-auto"
+readonly NETWORK_STATE="/var/lib/snell-net"
+readonly SECURITY_STATE="/var/lib/snell-security"
+readonly MENU_MARKER="# snellx - interactive manager for the Snell v6 installation created by snell-v6.sh"
 
 LOCK_HELD=0
 LAST_BACKUP=""
@@ -169,8 +173,8 @@ port_is_listening() {
 
 wait_for_port() {
   local port="$1"
-  local attempt
-  for attempt in $(seq 1 10); do
+  local _
+  for _ in $(seq 1 10); do
     if port_is_listening "$port"; then
       return 0
     fi
@@ -179,11 +183,24 @@ wait_for_port() {
   return 1
 }
 
+ephemeral_port_range() {
+  local low=0 high=0
+  if [[ -r /proc/sys/net/ipv4/ip_local_port_range ]]; then
+    IFS=$' \t' read -r low high < /proc/sys/net/ipv4/ip_local_port_range || true
+  fi
+  [[ "$low" =~ ^[0-9]+$ && "$high" =~ ^[0-9]+$ ]] || { low=0; high=0; }
+  printf '%s %s\n' "$low" "$high"
+}
+
+# Same policy as the installer: 10000-65000, outside the ephemeral range.
 generate_port() {
-  local port
-  local attempt
-  for attempt in $(seq 1 200); do
-    port="$((20000 + (10#$(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 40001)))"
+  local port low high avoid=1
+  local _
+  IFS=' ' read -r low high < <(ephemeral_port_range)
+  if (( low <= 10000 && high >= 65000 )); then avoid=0; fi
+  for _ in $(seq 1 400); do
+    port="$((10000 + (10#$(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 55001)))"
+    if (( avoid && port >= low && port <= high )); then continue; fi
     if port_is_free "$port"; then
       printf '%s\n' "$port"
       return 0
@@ -198,6 +215,18 @@ backup_config() {
   LAST_BACKUP="$(mktemp "${CONFIG_PATH}.bak.${stamp}.XXXXXX")" || die "无法创建配置备份。"
   cp -a -- "$CONFIG_PATH" "$LAST_BACKUP" || die "配置备份失败，未修改配置。"
   info "配置已备份：${LAST_BACKUP}"
+  prune_config_backups
+}
+
+# Keep the newest five config backups (they contain the PSK). Names embed a
+# timestamp, so name order is creation order; cp -a keeps the old mtime.
+prune_config_backups() {
+  local old
+  while IFS= read -r old; do
+    [[ "$old" == "${CONFIG_PATH}.bak."* && ! -L "$old" ]] && rm -f -- "$old"
+  done < <(find "$(dirname "$CONFIG_PATH")" -maxdepth 1 -type f -name "$(basename "$CONFIG_PATH").bak.*" -printf '%f\t%p\n' 2>/dev/null |
+    LC_ALL=C sort -r | awk -F '\t' 'NR > 5 { print $2 }')
+  return 0
 }
 
 restore_backup() {
@@ -256,7 +285,8 @@ replace_listen_port() {
 }
 
 firewall_backend() {
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+  # Capture first: with pipefail, "ufw status | grep -q" can fail via SIGPIPE.
+  if command -v ufw >/dev/null 2>&1 && grep -q '^Status: active' <<< "$(ufw status 2>/dev/null)"; then
     printf 'ufw\n'
   elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
     printf 'firewalld\n'
@@ -492,6 +522,83 @@ toggle_timer() {
   release_lock
 }
 
+show_or_set_channel() {
+  [[ -x "$MANAGER_PATH" ]] || die "未找到 ${MANAGER_PATH}。"
+  "$MANAGER_PATH" channel "$@"
+}
+
+choose_channel() {
+  local choice=""
+  show_or_set_channel
+  printf '\n1) stable：只自动安装正式版（推荐）\n2) prerelease：也自动安装 beta/rc\n0) 不修改\n'
+  read -r -p "请选择 [0]: " choice
+  case "${choice:-0}" in
+    1) show_or_set_channel stable ;;
+    2)
+      warn "Snell 预发布版曾改变协议，自动升级后可能需要同步升级 Surge。"
+      confirm "确认让自动升级安装 beta/rc？" && show_or_set_channel prerelease
+      ;;
+    0) info "未修改。" ;;
+    *) die "无效选择。" ;;
+  esac
+}
+
+owned_tool() {
+  local target="$1" marker="$2"
+  [[ -f "$target" && ! -L "$target" ]] && grep -Fq "$marker" "$target"
+}
+
+# Undo in reverse order of installation: hardening, network, Snell, tools.
+uninstall_all() {
+  local purge=0 assume_yes=0 arg target
+  for arg in "$@"; do
+    case "$arg" in
+      --purge) purge=1 ;;
+      --yes|-y) assume_yes=1 ;;
+      *) die "uninstall 只接受 --purge 和 --yes。" ;;
+    esac
+  done
+  warn "将依次：回滚安全加固 → 回滚网络参数 → 卸载 Snell 服务 → 删除 snellx 等管理工具。"
+  if (( purge )); then
+    warn "--purge 会同时删除配置、PSK、状态与备份；之后无法用原 PSK 恢复。"
+  else
+    info "配置和 PSK 将保留在 /etc/snell-server，可再次安装恢复。"
+  fi
+  if (( ! assume_yes )); then
+    confirm "确认卸载？" || { info "已取消。"; return 0; }
+  fi
+
+  if [[ -d "${SECURITY_STATE}/baseline" ]]; then
+    [[ -x "$SECURITY_TOOL" ]] || die "存在安全加固基线但缺少 ${SECURITY_TOOL}，已停止卸载。"
+    "$SECURITY_TOOL" rollback || die "安全配置回滚失败，已停止卸载；处理上方提示后重新运行 snellx uninstall。"
+  fi
+  if [[ -d "${NETWORK_STATE}/baseline" ]]; then
+    [[ -x "$NETWORK_TOOL" ]] || die "存在网络参数基线但缺少 ${NETWORK_TOOL}，已停止卸载。"
+    "$NETWORK_TOOL" rollback || die "网络参数回滚失败，已停止卸载；处理上方提示后重新运行 snellx uninstall。"
+  fi
+  if [[ -x "$MANAGER_PATH" ]]; then
+    if (( purge )); then "$MANAGER_PATH" uninstall --purge; else "$MANAGER_PATH" uninstall; fi ||
+      die "Snell 卸载失败，管理工具已保留以便重试。"
+  fi
+
+  owned_tool "$NETWORK_TOOL" 'zzzz-snell-auto-network.conf' && rm -f -- "$NETWORK_TOOL"
+  owned_tool "$SECURITY_TOOL" 'Managed by snell-security' && rm -f -- "$SECURITY_TOOL"
+  owned_tool "$AUTO_TOOL" '# snell-auto: self-contained Linux Snell v6 installer' && rm -f -- "$AUTO_TOOL"
+  if (( purge )); then
+    for target in "$NETWORK_STATE" "$SECURITY_STATE"; do
+      [[ -d "$target" && ! -L "$target" ]] && rm -rf -- "$target"
+    done
+    if id -u snell >/dev/null 2>&1 && ! pgrep -u snell >/dev/null 2>&1; then
+      userdel snell >/dev/null 2>&1 || warn "未能删除系统用户 snell，可稍后手动 userdel snell。"
+    fi
+  fi
+  # Unlinking the running script is safe: Bash keeps the open file.
+  for target in /usr/local/bin/snellx /usr/local/sbin/snellx; do
+    owned_tool "$target" "$MENU_MARKER" && rm -f -- "$target"
+  done
+  ok "卸载完成。防火墙中为 Snell 放行的端口规则未删除，确认不再使用后可手动删除。"
+}
+
 network_command() {
   [[ -x "$NETWORK_TOOL" ]] || die "未安装网络模块，请先运行 snell-auto.sh。"
   "$NETWORK_TOOL" "$@"
@@ -533,14 +640,24 @@ health_check() {
     warn "自动升级定时器未运行"
   fi
 
-  if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
-    if ufw status | grep -Eq "^${port}/tcp[[:space:]]+ALLOW"; then
-      ok "UFW 已放行 TCP ${port}"
-    else
-      warn "UFW 未发现 TCP ${port} 放行规则"
-      failed=1
-    fi
-  fi
+  case "$(firewall_backend)" in
+    ufw)
+      if grep -Eq "^${port}/tcp[[:space:]]+ALLOW" <<< "$(ufw status 2>/dev/null)"; then
+        ok "UFW 已放行 TCP ${port}"
+      else
+        warn "UFW 未发现 TCP ${port} 放行规则"
+        failed=1
+      fi
+      ;;
+    firewalld)
+      if firewall-cmd --query-port="${port}/tcp" >/dev/null 2>&1; then
+        ok "firewalld 已放行 TCP ${port}"
+      else
+        warn "firewalld 未放行 TCP ${port}"
+        failed=1
+      fi
+      ;;
+  esac
 
   if [[ "$failed" -eq 0 ]]; then
     ok "检查通过。"
@@ -568,32 +685,53 @@ print_menu() {
   printf '  13) 查看安全加固状态\n'
   printf '  14) 应用基础安全加固\n'
   printf '  15) 回滚本工具的安全配置\n'
+  printf '  16) 自动升级通道（正式版/预发布版）\n'
+  printf '  17) 完全卸载（先回滚加固和网络参数）\n'
   printf '  0) 退出\n'
   printf '%s\n' "──────────────────────────────"
+}
+
+# Each action runs in its own subshell with errexit on, so die/exit inside an
+# action (bad input, failed restart) returns to the menu instead of closing it.
+# A lock taken by the action is released when its subshell exits.
+run_menu_action() {
+  local status
+  set +e
+  ( set -e; "$@" )
+  status=$?
+  set -e
+  if (( status != 0 )); then warn "操作未完成（退出码 ${status}），已返回菜单。"; fi
+  return 0
 }
 
 interactive_menu() {
   local choice
   while true; do
     print_menu
-    read -r -p "请选择 [0-15]: " choice || return 0
+    read -r -p "请选择 [0-17]: " choice || return 0
+    choice="${choice//[[:space:]]/}"
     printf '\n'
     case "$choice" in
-      1) show_status || true ;;
-      2) show_connection || true ;;
-      3) update_snell || true ;;
-      4) restart_snell || true ;;
-      5) change_psk || true ;;
-      6) change_port || true ;;
-      7) show_logs || true ;;
-      8) toggle_timer || true ;;
-      9) health_check || true ;;
-      10) network_command diagnose || true ;;
-      11) optimize_network || true ;;
-      12) network_command rollback || true ;;
-      13) security_command status || true ;;
-      14) security_command apply || true ;;
-      15) security_command rollback || true ;;
+      1) run_menu_action require_installation_then show_status ;;
+      2) run_menu_action require_installation_then show_connection ;;
+      3) run_menu_action require_installation_then update_snell ;;
+      4) run_menu_action require_installation_then restart_snell ;;
+      5) run_menu_action require_installation_then change_psk ;;
+      6) run_menu_action require_installation_then change_port ;;
+      7) run_menu_action show_logs ;;
+      8) run_menu_action require_installation_then toggle_timer ;;
+      9) run_menu_action require_installation_then health_check ;;
+      10) run_menu_action network_command diagnose ;;
+      11) run_menu_action optimize_network ;;
+      12) run_menu_action network_command rollback ;;
+      13) run_menu_action security_command status ;;
+      14) run_menu_action security_command apply ;;
+      15) run_menu_action security_command rollback ;;
+      16) run_menu_action require_installation_then choose_channel ;;
+      17)
+        run_menu_action uninstall_all
+        [[ -e /usr/local/sbin/snellx ]] || return 0
+        ;;
       0) printf '再见。\n'; return 0 ;;
       *) warn "无效选择：${choice}" ;;
     esac
@@ -613,6 +751,7 @@ usage() {
   snellx port            修改/生成端口
   snellx logs            查看最近日志
   snellx timer           开启/关闭自动升级
+  snellx channel [stable|prerelease] 查看/设置自动升级通道
   snellx check           一键健康检查
   snellx diagnose        检测系统/网络（可追加 --probe IP）
   snellx optimize        应用保守的自适应网络参数
@@ -620,25 +759,34 @@ usage() {
   snellx security [--no-packages] 应用基础安全加固
   snellx security-status 查看安全加固状态
   snellx rollback-security 回滚本工具的安全配置
+  snellx uninstall [--purge] [--yes] 回滚加固/网络参数后卸载全部组件
 EOF
+}
+
+require_installation_then() {
+  require_installation
+  "$@"
 }
 
 main() {
   require_root
   require_systemd
-  require_installation
 
+  # Rollback, diagnostics and uninstall must keep working after Snell itself
+  # has been removed; only Snell-specific commands need a full installation.
   case "${1:-menu}" in
     menu) interactive_menu ;;
-    status) show_status ;;
-    show) show_connection ;;
-    update) update_snell ;;
-    restart) restart_snell ;;
-    psk) change_psk ;;
-    port) change_port ;;
+    status) require_installation; show_status ;;
+    show) require_installation; show_connection ;;
+    update) require_installation; update_snell ;;
+    restart) require_installation; restart_snell ;;
+    psk) require_installation; change_psk ;;
+    port) require_installation; change_port ;;
     logs) show_logs ;;
-    timer) toggle_timer ;;
-    check) health_check ;;
+    timer) require_installation; toggle_timer ;;
+    channel) shift; require_installation; show_or_set_channel "$@" ;;
+    check) require_installation; health_check ;;
+    uninstall) shift; uninstall_all "$@" ;;
     diagnose) shift; network_command diagnose "$@" ;;
     optimize) optimize_network ;;
     rollback-network) network_command rollback ;;

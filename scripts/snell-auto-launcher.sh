@@ -17,6 +17,8 @@ Snell v6 一键安装、自适应网络参数与基础安全加固
   sudo bash snell-auto.sh                       安装 Snell、网络优化和基础安全加固
   sudo bash snell-auto.sh install --network off  安装 Snell，不调整网络参数
   sudo bash snell-auto.sh install --no-auto-update 禁用 Snell 自动升级
+  sudo bash snell-auto.sh install --auto-update-channel prerelease
+                                                自动升级也安装 beta/rc（默认只自动装正式版）
   sudo bash snell-auto.sh install --security off 不应用安全加固
   bash snell-auto.sh diagnose [--probe IP]       只读检测，可选少量 ICMP 探测
   sudo snell-auto update                        检查并更新 v6
@@ -24,6 +26,7 @@ Snell v6 一键安装、自适应网络参数与基础安全加固
   sudo snell-auto security [--no-packages]       单独应用安全加固
   sudo snell-auto security-status               查看安全加固状态和跳过项
   sudo snell-auto rollback-security             回滚本工具的安全配置
+  sudo snellx uninstall [--purge]               回滚加固/网络参数并卸载全部组件
 
 安装后：snellx 打开管理菜单，含网络和安全诊断、应用、回滚。
 安全加固保留现有 SSH 登录方式和端口；防火墙只审计，不启用或重置。
@@ -60,14 +63,25 @@ auto_install_tool() {
     local backup
     backup="$(mktemp "/var/lib/snell-server/tool-backups/$(basename "$target").XXXXXX")"
     cp -p "$target" "$backup"
+    auto_prune_tool_backups "$(basename "$target")"
   fi
   staged="$(mktemp "${target}.new.XXXXXX")"
   install -o root -g root -m 0755 "$source" "$staged"
   mv -f "$staged" "$target"
 }
 
+# Keep the newest five backups per tool.
+auto_prune_tool_backups() {
+  local name="$1" old
+  while IFS= read -r old; do
+    [[ "$old" == /var/lib/snell-server/tool-backups/"$name".* ]] && rm -f -- "$old"
+  done < <(find /var/lib/snell-server/tool-backups -maxdepth 1 -type f -name "${name}.*" -printf '%T@\t%p\n' 2>/dev/null |
+    LC_ALL=C sort -rn | awk -F '\t' 'NR > 5 { print $2 }')
+  return 0
+}
+
 auto_main() {
-  local command="${1:-install}" network=auto security=auto auto_update=preserve arg
+  local command="${1:-install}" network=auto security=auto auto_update=preserve channel='' arg failed=0
   [[ $# -eq 0 ]] || shift
   case "$command" in help|-h|--help) auto_usage; return 0 ;; esac
   [[ "$(uname -s)" == Linux ]] || auto_die "此文件请上传到 Linux VPS 后执行；当前系统不是 Linux。"
@@ -107,6 +121,10 @@ auto_main() {
         security="$1"; shift
         [[ "$security" == auto || "$security" == off ]] || auto_die "--security 需要 auto 或 off。" ;;
       --auto-update) auto_update=on ;;
+      --auto-update-channel)
+        [[ $# -gt 0 ]] || auto_die "--auto-update-channel 需要 stable 或 prerelease。"
+        channel="$1"; shift
+        [[ "$channel" == stable || "$channel" == prerelease ]] || auto_die "--auto-update-channel 需要 stable 或 prerelease。" ;;
       *) auto_die "未知安装选项：${arg}" ;;
     esac
   done
@@ -122,11 +140,13 @@ auto_main() {
   )
   auto_log "环境检测（这是 VPS 侧检测，不代表你本地到 VPS 的速度）："
   bash "$auto_tmp/snell-net" diagnose
+  local -a manager_args=(install)
   case "$auto_update" in
-    off) bash "$auto_tmp/snell-manager" install --no-auto-update ;;
-    on) bash "$auto_tmp/snell-manager" install --auto-update ;;
-    *) bash "$auto_tmp/snell-manager" install ;;
+    off) manager_args+=(--no-auto-update) ;;
+    on) manager_args+=(--auto-update) ;;
   esac
+  [[ -z "$channel" ]] || manager_args+=(--auto-update-channel "$channel")
+  bash "$auto_tmp/snell-manager" "${manager_args[@]}"
   auto_install_tool "$auto_tmp/snellx" /usr/local/sbin/snellx
   # If an older copy of our menu is earlier in PATH, update it too.
   if [[ -e /usr/local/bin/snellx && ! /usr/local/bin/snellx -ef /usr/local/sbin/snellx ]]; then
@@ -145,18 +165,22 @@ auto_main() {
         auto_die "网络优化已撤回，Snell 已恢复。"
       fi
     else
-      auto_log "网络参数未成功应用；Snell 已安装。可用 snellx diagnose 查看原因。"
-      return 1
+      auto_log "网络参数未成功应用；Snell 已安装，继续后续步骤。可用 snellx diagnose 查看原因。"
+      failed=1
     fi
   fi
   if [[ "$security" == auto ]]; then
     auto_log "检查并应用基础安全加固……"
     if ! /usr/local/sbin/snell-security apply; then
       auto_log "安全加固未全部完成；Snell 已安装。请用 snellx security-status 查看状态。"
-      return 1
+      failed=1
     fi
   fi
-  /usr/local/sbin/snellx check
+  /usr/local/sbin/snellx check || failed=1
+  if [[ "$failed" -ne 0 ]]; then
+    auto_log "Snell 已安装，但上方有步骤未完成（网络参数、安全加固或健康检查），请按提示处理。"
+    return 1
+  fi
   auto_log "安装流程完成。输入 snellx 管理；snellx diagnose 和 security-status 查看实际状态。"
   auto_log "请检查服务商安全组是否放行上面显示的 TCP 端口。"
 }

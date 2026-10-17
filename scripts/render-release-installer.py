@@ -17,6 +17,7 @@ payload = ROOT / "outputs" / "snell-auto.sh"
 digest = hashlib.sha256(payload.read_bytes()).hexdigest()
 source = (ROOT / "scripts" / "snell-release-install.sh").read_text()
 for marker, value in {
+    "__TEMPLATE_NOTE__": "Generated from scripts/snell-release-install.sh by scripts/render-release-installer.py; do not edit.",
     "__GITHUB_REPOSITORY__": repository,
     "__RELEASE_TAG__": tag,
     "__BUNDLE_SHA256__": digest,

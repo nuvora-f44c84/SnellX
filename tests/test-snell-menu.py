@@ -132,6 +132,9 @@ elif tool == "network":
 elif tool == "security":
     print("mock security: " + " ".join(args))
     sys.exit(int(os.environ.get("TEST_SECURITY_EXIT", "0")))
+elif tool == "manager":
+    print("mock manager: " + " ".join(args))
+    sys.exit(int(os.environ.get("TEST_MANAGER_EXIT", "0")))
 else:
     print("blocked unexpected tool: " + tool, file=sys.stderr)
     sys.exit(97)
@@ -376,6 +379,84 @@ class MenuTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("未安装安全模块", result.stderr)
         self.assertEqual(self.events("security"), [])
+
+
+    def test_menu_returns_to_menu_after_invalid_input(self):
+        # Mismatched manual PSK, then a privileged port: both used to exit the
+        # whole menu because die() calls exit inside "action || true".
+        result = self.run_bash(
+            "clear() { :; }\ninteractive_menu\nprintf 'MENU-STILL-RUNNING\\n'\n",
+            stdin="5\n2\nabcdefghijklm\nDIFFERENT\n6\n80\n 0 \n",
+        )
+        self.assert_success(result)
+        self.assertIn("两次输入不一致", result.stderr)
+        self.assertIn("端口范围必须是", result.stderr)
+        self.assertEqual(result.stderr.count("已返回菜单"), 2)
+        self.assertIn("MENU-STILL-RUNNING", result.stdout)
+        self.assertEqual(self.config.read_bytes(), self.original_config)
+        self.assertFalse(any(e["args"][:1] == ["restart"] for e in self.events("systemctl")))
+
+    def test_rollback_commands_work_after_snell_is_uninstalled(self):
+        self.binary.unlink()
+        result = self.run_bash("main rollback-network\n")
+        self.assert_success(result)
+        self.assertEqual(self.events("network")[-1]["args"], ["rollback"])
+        result = self.run_bash("main rollback-security\n")
+        self.assert_success(result)
+        self.assertEqual(self.events("security")[-1]["args"], ["rollback"])
+        result = self.run_bash("main status\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("未找到 Snell 程序", result.stderr)
+
+    def _uninstall_fixture(self):
+        manager = self.root / "usr/local/sbin/snell-manager"
+        manager.write_text('#!/bin/sh\nexec "$TEST_PYTHON" "$TEST_HELPER" manager "$@"\n')
+        manager.chmod(0o755)
+        self.network.write_text(
+            '#!/bin/sh\n# zzzz-snell-auto-network.conf\nexec "$TEST_PYTHON" "$TEST_HELPER" network "$@"\n')
+        self.security.write_text(
+            '#!/bin/sh\n# Managed by snell-security\nexec "$TEST_PYTHON" "$TEST_HELPER" security "$@"\n')
+        (self.root / "var/lib/snell-net/baseline").mkdir(parents=True)
+        (self.root / "var/lib/snell-security/baseline").mkdir(parents=True)
+
+    def test_uninstall_rolls_back_before_removing_snell_and_tools(self):
+        self._uninstall_fixture()
+        result = self.run_bash("main uninstall --yes\n")
+        self.assert_success(result)
+        order = [e["tool"] for e in self.events() if e["tool"] in ("security", "network", "manager")]
+        self.assertEqual(order, ["security", "network", "manager"])
+        self.assertEqual(self.events("manager")[-1]["args"], ["uninstall"])
+        self.assertFalse(self.network.exists())
+        self.assertFalse(self.security.exists())
+        self.assertEqual(self.config.read_bytes(), self.original_config)
+
+    def test_uninstall_stops_when_security_rollback_fails(self):
+        self._uninstall_fixture()
+        result = self.run_bash("main uninstall --yes\n", env={"TEST_SECURITY_EXIT": "1"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("已停止卸载", result.stderr)
+        self.assertEqual(self.events("network"), [])
+        self.assertEqual(self.events("manager"), [])
+        self.assertTrue(self.network.exists())
+        self.assertTrue(self.security.exists())
+
+    def test_uninstall_requires_confirmation(self):
+        self._uninstall_fixture()
+        result = self.run_bash("main uninstall\n", stdin="n\n")
+        self.assert_success(result)
+        self.assertEqual(self.events("security") + self.events("manager"), [])
+
+    def test_generated_port_avoids_ephemeral_range(self):
+        result = self.run_bash(
+            "ephemeral_port_range() { printf '32768 60999\\n'; }\n"
+            "port_is_free() { return 0; }\n"
+            "for i in $(seq 1 300); do generate_port; done\n")
+        self.assert_success(result)
+        ports = [int(x) for x in result.stdout.split()]
+        self.assertEqual(len(ports), 300)
+        for port in ports:
+            self.assertTrue(10000 <= port <= 65000, port)
+            self.assertFalse(32768 <= port <= 60999, port)
 
 
 if __name__ == "__main__":

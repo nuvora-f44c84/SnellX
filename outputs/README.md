@@ -92,6 +92,7 @@ snellx restart              # 重启 Snell，会中断现有连接
 snellx psk                  # 修改/随机生成 PSK
 snellx port                 # 修改/随机生成端口
 snellx timer                # 开关自动更新
+snellx channel              # 查看自动更新通道；snellx channel prerelease 允许自动装 beta/rc
 snellx check                # 本机健康检查
 snellx diagnose             # 检测系统与网络
 snellx optimize             # 再次应用网络参数
@@ -100,6 +101,7 @@ snellx security-status      # 查看安全配置、服务与执行报告
 snellx security             # 应用基础安全加固
 snellx security --no-packages # 加固，但不安装安全组件
 snellx rollback-security    # 恢复首次安全加固前状态
+snellx uninstall            # 回滚加固和网络参数后卸载全部组件（--purge 连配置/PSK 一起清除）
 ```
 
 ```bash
@@ -130,9 +132,11 @@ bash /root/snell-auto.sh install --no-auto-update
 
 自动更新定时器在开机 15 分钟后检查，随机延迟最多 1 小时；随后约每 24 小时检查，另加随机延迟。使用单调时钟，不承诺补跑关机期间任务。
 
-只更新 v6，不自动切到 v7；beta/rc 参与比较，同一基础版本按 beta、rc、正式版排序。官方预发布版本可能改变协议兼容性，客户端需要保持兼容。
+只更新 v6，不自动切到 v7；同一基础版本按 beta、rc、正式版排序。
 
-下载使用 HTTPS、固定官方域名，检查压缩包成员和程序 v6 版本。SHA-256 用于本地比较是否变化，**并非对照官方签名或官方校验和**。
+自动更新默认使用 **stable 通道：定时任务只自动安装正式版**。官方预发布版曾改变协议，需要同步升级 Surge，所以不会在无人值守时自动装上。首次安装和手动 `snellx update` 仍安装官方最新版（含 beta/rc）；目前 v6 只有预发布版。需要自动跟进 beta/rc 时执行 `snellx channel prerelease`，或安装时加 `--auto-update-channel prerelease`。
+
+下载使用 HTTPS、固定官方域名（仅允许 HTTPS 跳转），检查压缩包成员、ELF 架构和程序 v6 版本；版本检查以 snell 低权限用户执行。SHA-256 用于本地比较是否变化，**并非对照官方签名或官方校验和**。
 
 | 内容 | 路径 |
 |---|---|
@@ -149,11 +153,11 @@ bash /root/snell-auto.sh install --no-auto-update
 | APT 周期 / 禁止自动重启 | /etc/apt/apt.conf.d/99snell-auto-periodic / 99zz-snell-auto-no-reboot |
 
 ```bash
-snell-manager uninstall          # 保留配置和 PSK，可再次安装
-snell-manager uninstall --purge  # 清除配置、PSK、Snell 状态和程序备份
+snellx uninstall          # 回滚安全加固和网络参数 → 卸载 Snell → 删除管理工具；保留配置和 PSK
+snellx uninstall --purge  # 同上，并清除配置、PSK、状态、备份和 snell 系统用户
 ```
 
-卸载 Snell 不撤销网络/安全配置，不删除独立管理工具和防火墙放行规则。需要撤销时先用 `snell-net rollback` 和 `snell-security rollback`。旧安全加固脚本 vps-hardening.sh 未纳入自动流程。
+任一回滚失败时卸载会停止，管理工具保留以便处理后重试。防火墙放行规则不删除，确认无其他用途后可手动删除。只想卸载 Snell 服务、保留加固和网络参数时，可用 `snell-manager uninstall [--purge]`；之后 `snellx` 仍可执行回滚和卸载命令。程序、工具和配置备份各保留最近 5 份。旧安全加固脚本 vps-hardening.sh 未纳入自动流程。
 
 ## 构建与验证
 

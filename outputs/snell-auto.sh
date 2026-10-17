@@ -17,6 +17,8 @@ Snell v6 一键安装、自适应网络参数与基础安全加固
   sudo bash snell-auto.sh                       安装 Snell、网络优化和基础安全加固
   sudo bash snell-auto.sh install --network off  安装 Snell，不调整网络参数
   sudo bash snell-auto.sh install --no-auto-update 禁用 Snell 自动升级
+  sudo bash snell-auto.sh install --auto-update-channel prerelease
+                                                自动升级也安装 beta/rc（默认只自动装正式版）
   sudo bash snell-auto.sh install --security off 不应用安全加固
   bash snell-auto.sh diagnose [--probe IP]       只读检测，可选少量 ICMP 探测
   sudo snell-auto update                        检查并更新 v6
@@ -24,6 +26,7 @@ Snell v6 一键安装、自适应网络参数与基础安全加固
   sudo snell-auto security [--no-packages]       单独应用安全加固
   sudo snell-auto security-status               查看安全加固状态和跳过项
   sudo snell-auto rollback-security             回滚本工具的安全配置
+  sudo snellx uninstall [--purge]               回滚加固/网络参数并卸载全部组件
 
 安装后：snellx 打开管理菜单，含网络和安全诊断、应用、回滚。
 安全加固保留现有 SSH 登录方式和端口；防火墙只审计，不启用或重置。
@@ -60,14 +63,25 @@ auto_install_tool() {
     local backup
     backup="$(mktemp "/var/lib/snell-server/tool-backups/$(basename "$target").XXXXXX")"
     cp -p "$target" "$backup"
+    auto_prune_tool_backups "$(basename "$target")"
   fi
   staged="$(mktemp "${target}.new.XXXXXX")"
   install -o root -g root -m 0755 "$source" "$staged"
   mv -f "$staged" "$target"
 }
 
+# Keep the newest five backups per tool.
+auto_prune_tool_backups() {
+  local name="$1" old
+  while IFS= read -r old; do
+    [[ "$old" == /var/lib/snell-server/tool-backups/"$name".* ]] && rm -f -- "$old"
+  done < <(find /var/lib/snell-server/tool-backups -maxdepth 1 -type f -name "${name}.*" -printf '%T@\t%p\n' 2>/dev/null |
+    LC_ALL=C sort -rn | awk -F '\t' 'NR > 5 { print $2 }')
+  return 0
+}
+
 auto_main() {
-  local command="${1:-install}" network=auto security=auto auto_update=preserve arg
+  local command="${1:-install}" network=auto security=auto auto_update=preserve channel='' arg failed=0
   [[ $# -eq 0 ]] || shift
   case "$command" in help|-h|--help) auto_usage; return 0 ;; esac
   [[ "$(uname -s)" == Linux ]] || auto_die "此文件请上传到 Linux VPS 后执行；当前系统不是 Linux。"
@@ -107,6 +121,10 @@ auto_main() {
         security="$1"; shift
         [[ "$security" == auto || "$security" == off ]] || auto_die "--security 需要 auto 或 off。" ;;
       --auto-update) auto_update=on ;;
+      --auto-update-channel)
+        [[ $# -gt 0 ]] || auto_die "--auto-update-channel 需要 stable 或 prerelease。"
+        channel="$1"; shift
+        [[ "$channel" == stable || "$channel" == prerelease ]] || auto_die "--auto-update-channel 需要 stable 或 prerelease。" ;;
       *) auto_die "未知安装选项：${arg}" ;;
     esac
   done
@@ -122,11 +140,13 @@ auto_main() {
   )
   auto_log "环境检测（这是 VPS 侧检测，不代表你本地到 VPS 的速度）："
   bash "$auto_tmp/snell-net" diagnose
+  local -a manager_args=(install)
   case "$auto_update" in
-    off) bash "$auto_tmp/snell-manager" install --no-auto-update ;;
-    on) bash "$auto_tmp/snell-manager" install --auto-update ;;
-    *) bash "$auto_tmp/snell-manager" install ;;
+    off) manager_args+=(--no-auto-update) ;;
+    on) manager_args+=(--auto-update) ;;
   esac
+  [[ -z "$channel" ]] || manager_args+=(--auto-update-channel "$channel")
+  bash "$auto_tmp/snell-manager" "${manager_args[@]}"
   auto_install_tool "$auto_tmp/snellx" /usr/local/sbin/snellx
   # If an older copy of our menu is earlier in PATH, update it too.
   if [[ -e /usr/local/bin/snellx && ! /usr/local/bin/snellx -ef /usr/local/sbin/snellx ]]; then
@@ -145,18 +165,22 @@ auto_main() {
         auto_die "网络优化已撤回，Snell 已恢复。"
       fi
     else
-      auto_log "网络参数未成功应用；Snell 已安装。可用 snellx diagnose 查看原因。"
-      return 1
+      auto_log "网络参数未成功应用；Snell 已安装，继续后续步骤。可用 snellx diagnose 查看原因。"
+      failed=1
     fi
   fi
   if [[ "$security" == auto ]]; then
     auto_log "检查并应用基础安全加固……"
     if ! /usr/local/sbin/snell-security apply; then
       auto_log "安全加固未全部完成；Snell 已安装。请用 snellx security-status 查看状态。"
-      return 1
+      failed=1
     fi
   fi
-  /usr/local/sbin/snellx check
+  /usr/local/sbin/snellx check || failed=1
+  if [[ "$failed" -ne 0 ]]; then
+    auto_log "Snell 已安装，但上方有步骤未完成（网络参数、安全加固或健康检查），请按提示处理。"
+    return 1
+  fi
   auto_log "安装流程完成。输入 snellx 管理；snellx diagnose 和 security-status 查看实际状态。"
   auto_log "请检查服务商安全组是否放行上面显示的 TCP 端口。"
 }
@@ -190,6 +214,7 @@ readonly HASH_STATE="${STATE_DIR}/sha256"
 readonly PORT_STATE="${STATE_DIR}/port"
 readonly FIREWALL_STATE="${STATE_DIR}/firewall"
 readonly OWNER_STATE="${STATE_DIR}/managed-by"
+readonly CHANNEL_STATE="${STATE_DIR}/auto-update-channel"
 readonly SERVICE_UNIT="/etc/systemd/system/snell-server.service"
 readonly UPDATE_SERVICE_UNIT="/etc/systemd/system/snell-update.service"
 readonly UPDATE_TIMER_UNIT="/etc/systemd/system/snell-update.timer"
@@ -197,11 +222,15 @@ readonly SERVICE_NAME="snell-server.service"
 readonly TIMER_NAME="snell-update.timer"
 readonly LOCK_FILE="/run/lock/snell-manager.lock"
 readonly SERVICE_MARKER="Managed by snell-v6.sh"
+readonly BACKUP_KEEP=5
 
 QUIET=0
 TMP_DIR=""
 LOCK_HELD=0
 AUTO_UPDATE="preserve"
+AUTO_CHANNEL=""
+UPDATE_MODE="manual"
+LAST_BINARY_BACKUP=""
 
 log() {
   if [[ "$QUIET" -eq 0 ]]; then
@@ -238,7 +267,7 @@ require_linux_systemd() {
   if command -v getconf >/dev/null 2>&1; then
     getconf GNU_LIBC_VERSION >/dev/null 2>&1 ||
       die "官方 Snell 二进制依赖 glibc，不支持 Alpine/musl。请改用 Debian、Ubuntu、RHEL 等 glibc 系统。"
-  elif command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
+  elif command -v ldd >/dev/null 2>&1 && grep -qi musl <<< "$(ldd --version 2>&1)"; then
     die "官方 Snell 二进制依赖 glibc，不支持 Alpine/musl。请改用 Debian、Ubuntu、RHEL 等 glibc 系统。"
   fi
 }
@@ -253,7 +282,9 @@ acquire_lock() {
 install_dependencies() {
   local missing=0
   local cmd
-  for cmd in curl unzip sha256sum awk sed grep od ip ss tc sysctl flock timeout getent useradd groupadd; do
+  # tc is optional (diagnostics only); on RHEL 8+ it lives in iproute-tc, so
+  # requiring it here would re-run the package manager on every update.
+  for cmd in curl unzip sha256sum awk sed grep od ip ss sysctl flock timeout getent useradd groupadd; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
       missing=1
       break
@@ -264,8 +295,9 @@ install_dependencies() {
   log "安装必要依赖……"
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    apt-get install -y -qq curl unzip ca-certificates coreutils gawk iproute2 procps util-linux passwd kmod
+    # A fresh VPS often has unattended-upgrades/cloud-init holding the dpkg lock.
+    apt-get -o DPkg::Lock::Timeout=180 update -qq
+    apt-get -o DPkg::Lock::Timeout=180 install -y -qq curl unzip ca-certificates coreutils gawk iproute2 procps util-linux passwd kmod
   elif command -v dnf >/dev/null 2>&1; then
     dnf install -y curl unzip ca-certificates coreutils gawk iproute procps-ng util-linux shadow-utils kmod
   elif command -v yum >/dev/null 2>&1; then
@@ -305,18 +337,21 @@ version_key() {
   printf '6.%06d.%06d.%d.%06d\n' "$((10#$minor))" "$((10#$patch))" "$rank" "$((10#$suffix))"
 }
 
+is_prerelease_key() { [[ "$1" != *.3.000000 ]]; }
+
 select_release_url() {
-  local asset_arch="$1" url tag key
+  local asset_arch="$1" channel="${2:-any}" url tag key
   while IFS= read -r url; do
     tag="${url##*/snell-server-}"; tag="${tag%-linux-*}"
     key="$(version_key "$tag")" || continue
+    if [[ "$channel" == stable ]] && is_prerelease_key "$key"; then continue; fi
     printf '%s\t%s\n' "$key" "$url"
   done < <(grep -Eo 'https://[^[:space:]"<>`)]+' | grep -E "^https://dl\\.nssurge\\.com/snell/snell-server-v6\\.[0-9]+\\.[0-9]+((beta|rc)[0-9]*)?-linux-${asset_arch}\\.zip$") |
     LC_ALL=C sort -ru | awk 'NR == 1 { print $2 }'
 }
 
 fetch_release_url() {
-  local asset_arch="$1"
+  local asset_arch="$1" channel="${2:-any}"
   local page
   local url
 
@@ -328,9 +363,10 @@ fetch_release_url() {
 
   url="$(
     printf '%s\n' "$page" |
-      select_release_url "$asset_arch"
+      select_release_url "$asset_arch" "$channel"
   )"
 
+  if [[ -z "$url" && "$channel" == stable ]]; then return 2; fi
   [[ -n "$url" ]] || die "官方页面未找到适用于 ${asset_arch} 的 Snell v6 下载地址。"
   [[ "$url" == "${DOWNLOAD_PREFIX}"* ]] || die "发布地址未通过域名白名单校验。"
   printf '%s\n' "$url"
@@ -354,8 +390,8 @@ download_and_verify_binary() {
   local version_output
 
   log "下载官方 Snell v6：${url##*/}"
-  curl -fsS \
-    --proto '=https' --tlsv1.2 \
+  curl -fsS --location --max-redirs 5 \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 \
     --retry 3 --retry-delay 2 \
     --connect-timeout 10 --max-time 180 \
     -o "$archive" "$url" || die "下载 Snell v6 失败。"
@@ -378,20 +414,37 @@ download_and_verify_binary() {
 
   unzip -p "$archive" "$member" > "${TMP_DIR}/snell-server"
   chmod 0755 "${TMP_DIR}/snell-server"
+  elf_matches_arch "${TMP_DIR}/snell-server" "$expected_arch" ||
+    die "下载的文件不是 ${expected_arch} 架构的 Linux ELF 程序。"
 
-  version_output="$(timeout 10 "${TMP_DIR}/snell-server" --version 2>&1)" ||
+  version_output="$(run_unprivileged "${TMP_DIR}/snell-server" --version 2>&1)" ||
     die "下载的 Snell 二进制无法在当前系统执行。"
   printf '%s\n' "$version_output" | grep -Eq 'snell-server v6\.' ||
     die "下载的文件不是 Snell v6 二进制。"
+}
 
-  case "$expected_arch" in
-    amd64)
-      printf '%s\n' "$version_output" >/dev/null
-      ;;
-    i386|aarch64)
-      printf '%s\n' "$version_output" >/dev/null
-      ;;
-  esac
+# Check the ELF magic and e_machine (little-endian u16 at offset 18) before
+# executing anything: x86-64=62, i386=3, aarch64=183.
+elf_matches_arch() {
+  local file="$1" arch="$2" magic low high machine expected
+  magic="$(od -An -N4 -tx1 "$file" 2>/dev/null | tr -d ' \n')" || return 1
+  [[ "$magic" == 7f454c46 ]] || return 1
+  IFS=" " read -r low high < <(od -An -j18 -N2 -tu1 "$file" 2>/dev/null) || return 1
+  [[ "$low" =~ ^[0-9]+$ && "$high" =~ ^[0-9]+$ ]] || return 1
+  machine=$((low + 256 * high))
+  case "$arch" in amd64) expected=62 ;; i386) expected=3 ;; aarch64) expected=183 ;; *) return 1 ;; esac
+  [[ "$machine" == "$expected" ]]
+}
+
+# Run a freshly downloaded program as the unprivileged service account when
+# possible, so a bad download never gets root just to print its version.
+run_unprivileged() {
+  if command -v setpriv >/dev/null 2>&1 && id -u snell >/dev/null 2>&1; then
+    chmod 0711 "$TMP_DIR" || return 1
+    timeout 10 setpriv --reuid=snell --regid=snell --clear-groups --no-new-privs -- "$@"
+  else
+    timeout 10 "$@"
+  fi
 }
 
 atomic_install_binary() {
@@ -466,6 +519,28 @@ service_listening() {
   '
 }
 
+auto_update_channel() {
+  local channel="stable"
+  if [[ -s "$CHANNEL_STATE" ]]; then channel="$(<"$CHANNEL_STATE")"; fi
+  case "$channel" in stable|prerelease) printf '%s\n' "$channel" ;; *) printf 'stable\n' ;; esac
+}
+
+# Keep only the newest backups; never touch paths outside our backup directory.
+prune_backups() {
+  local directory="$1" pattern="$2" keep="${3:-$BACKUP_KEEP}" old
+  [[ -d "$directory" && ! -L "$directory" ]] || return 0
+  while IFS= read -r old; do
+    [[ -n "$old" && "$old" == "$directory/"* && ! -L "$old" ]] || continue
+    rm -rf -- "$old"
+  # Names embed a YYYYmmdd-HHMMSS stamp, so name order is creation order
+  # (mtime is not: cp -a keeps the source file's time).
+  done < <(find "$directory" -mindepth 1 -maxdepth 1 -name "$pattern" -printf '%f\t%p\n' 2>/dev/null |
+    LC_ALL=C sort -r | awk -F '\t' -v keep="$keep" 'NR > keep { print $2 }')
+}
+
+# restart_service=yes restarts and verifies, rolling back on failure.
+# restart_service=no only installs the binary; LAST_BINARY_BACKUP lets the
+# caller roll back after its own restart.
 perform_update() {
   local restart_service="${1:-yes}"
   local asset_arch
@@ -474,11 +549,22 @@ perform_update() {
   local new_hash
   local current_hash=""
   local backup_binary=""
-  local current_tag="" remote_key current_key backup_dir
+  local current_tag="" remote_key current_key backup_dir="" channel=any status=0
 
+  LAST_BINARY_BACKUP=""
   TMP_DIR="$(mktemp -d /tmp/snell-update.XXXXXX)"
   asset_arch="$(detect_asset_arch)"
-  release_url="$(fetch_release_url "$asset_arch")"
+  # Unattended updates follow the configured channel (stable by default):
+  # Snell prereleases have changed the protocol before and need a client update.
+  if [[ "$UPDATE_MODE" == auto ]]; then
+    [[ "$(auto_update_channel)" == prerelease ]] || channel=stable
+  fi
+  release_url="$(fetch_release_url "$asset_arch" "$channel")" || status=$?
+  if [[ "$status" -eq 2 ]]; then
+    log "自动更新只安装正式版：官方页面暂无 v6 正式版，保留当前程序。预发布版请手动运行 snellx update。"
+    return 0
+  fi
+  [[ "$status" -eq 0 ]] || die "无法获取官方下载地址。"
   remote_tag="$(release_tag_from_url "$release_url")"
   remote_key="$(version_key "$remote_tag")" || die "无法比较官方版本。"
   if [[ -x "$BIN_PATH" ]]; then
@@ -531,7 +617,20 @@ perform_update() {
   fi
 
   record_release_state "$remote_tag" "$new_hash"
+  LAST_BINARY_BACKUP="$backup_binary"
+  if [[ -n "$backup_dir" ]]; then prune_backups "${STATE_DIR}/backups" 'update-*' || true; fi
   log "Snell 已升级到官方版本：${remote_tag}"
+}
+
+# Used by install when the new binary only fails after the units are rewritten.
+restore_previous_binary() {
+  local backup="$LAST_BINARY_BACKUP" backup_dir
+  [[ -n "$backup" && -x "$backup" ]] || return 1
+  backup_dir="$(dirname "$backup")"
+  atomic_install_binary "$backup" || return 1
+  if [[ -f "${backup_dir}/release" ]]; then cp -a "${backup_dir}/release" "$RELEASE_STATE"; fi
+  if [[ -f "${backup_dir}/sha256" ]]; then cp -a "${backup_dir}/sha256" "$HASH_STATE"; fi
+  restart_and_verify_service
 }
 
 create_service_user() {
@@ -561,19 +660,32 @@ port_in_use() {
   ' /proc/net/tcp /proc/net/tcp6 2>/dev/null
 }
 
+# Print the kernel's ephemeral (outbound) port range as "low high".
+ephemeral_port_range() {
+  local low=0 high=0
+  if [[ -r /proc/sys/net/ipv4/ip_local_port_range ]]; then
+    IFS=$' \t' read -r low high < /proc/sys/net/ipv4/ip_local_port_range || true
+  fi
+  [[ "$low" =~ ^[0-9]+$ && "$high" =~ ^[0-9]+$ ]] || { low=0; high=0; }
+  printf '%s %s\n' "$low" "$high"
+}
+
+# Random free port in 10000-65000, outside the ephemeral range so an outbound
+# connection cannot grab it while Snell restarts.
 generate_port() {
-  local attempt
-  local raw
-  local port
-  for ((attempt = 0; attempt < 200; attempt++)); do
+  local attempt raw port low high avoid=1
+  IFS=' ' read -r low high < <(ephemeral_port_range)
+  if (( low <= 10000 && high >= 65000 )); then avoid=0; fi
+  for ((attempt = 0; attempt < 400; attempt++)); do
     raw="$(od -An -N2 -tu2 /dev/urandom | tr -d ' ')"
-    port=$((10000 + raw % 50001))
+    port=$((10000 + raw % 55001))
+    if (( avoid && port >= low && port <= high )); then continue; fi
     if ! port_in_use "$port"; then
       printf '%s\n' "$port"
       return 0
     fi
   done
-  die "尝试 200 次后仍无法找到空闲端口。"
+  die "尝试 400 次后仍无法找到空闲端口。"
 }
 
 generate_psk() {
@@ -584,7 +696,7 @@ generate_psk() {
 ipv6_available() {
   [[ -s /proc/net/if_inet6 ]] &&
     [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || printf '1')" == "0" ]] &&
-    ip -6 addr show scope global | grep -q 'inet6 ' &&
+    [[ "$(ip -6 addr show scope global 2>/dev/null)" == *'inet6 '* ]] &&
     [[ -n "$(ip -6 route show default)" ]]
 }
 
@@ -714,7 +826,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/snell-manager update --quiet
+ExecStart=/usr/local/sbin/snell-manager update --quiet --auto
 EOF
 
   cat > "$UPDATE_TIMER_UNIT" <<'EOF'
@@ -757,7 +869,8 @@ install_manager_copy() {
 
 open_firewall() {
   local port="$1"
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+  # Capture first: with pipefail, "ufw status | grep -q" can fail via SIGPIPE.
+  if command -v ufw >/dev/null 2>&1 && grep -q '^Status: active' <<< "$(ufw status 2>/dev/null)"; then
     ufw allow "${port}/tcp" comment 'Snell v6' >/dev/null
     printf 'ufw\n' > "$FIREWALL_STATE"
     log "已放行 UFW TCP 端口 ${port}。"
@@ -844,12 +957,20 @@ install_snell() {
   create_service_user
   ensure_config
   install_manager_copy
-  if [[ "$was_installed" -eq 1 ]]; then perform_update yes; else perform_update no; fi
+  # Install the binary without restarting; the single restart below covers
+  # both a new binary and rewritten units, so clients are interrupted once.
+  perform_update no
   write_service_units
+  record_channel
 
   systemctl enable "$SERVICE_NAME"
   if ! restart_and_verify_service; then
     journalctl -u "$SERVICE_NAME" -n 40 --no-pager >&2 || true
+    if [[ -n "$LAST_BINARY_BACKUP" ]]; then
+      warn "新版本启动失败，正在恢复旧版本。"
+      restore_previous_binary || die "恢复旧版本后服务仍异常，请查看 journalctl -u ${SERVICE_NAME}。"
+      die "新版本无法启动，已恢复旧版本并重新运行。"
+    fi
     die "Snell 服务未能启动，请查看上方日志。"
   fi
   case "$AUTO_UPDATE" in
@@ -875,6 +996,24 @@ update_snell() {
   perform_update yes
 }
 
+record_channel() {
+  [[ -n "$AUTO_CHANNEL" ]] || return 0
+  install -d -o root -g root -m 0755 "$STATE_DIR"
+  printf '%s\n' "$AUTO_CHANNEL" > "$CHANNEL_STATE"
+  chmod 0644 "$CHANNEL_STATE"
+}
+
+channel_snell() {
+  require_root
+  if [[ -n "$AUTO_CHANNEL" ]]; then
+    acquire_lock
+    record_channel
+    log "自动更新通道已设为：${AUTO_CHANNEL}"
+  else
+    printf '自动更新通道：%s（stable=只自动安装正式版；prerelease=也自动安装 beta/rc）\n' "$(auto_update_channel)"
+  fi
+}
+
 status_snell() {
   require_root
   local release="unknown"
@@ -883,6 +1022,7 @@ status_snell() {
   printf '服务状态：%s\n' "$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)"
   printf '开机启动：%s\n' "$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || true)"
   printf '自动升级：%s\n' "$(systemctl is-active "$TIMER_NAME" 2>/dev/null || true)"
+  printf '自动升级通道：%s\n' "$(auto_update_channel)"
   printf '定时计划：\n'
   systemctl list-timers "$TIMER_NAME" --no-pager 2>/dev/null || true
 }
@@ -924,6 +1064,7 @@ Snell v6 一键管理脚本
   sudo snell-manager update           立即检查并安装官方 v6 更新
   sudo snell-manager show             显示 Surge 连接配置（包含 PSK）
   sudo snell-manager status           显示服务与自动升级状态
+  sudo snell-manager channel [stable|prerelease] 查看/设置自动更新通道
   sudo snell-manager uninstall        卸载程序，保留配置和 PSK
   sudo snell-manager uninstall --purge 卸载并清除配置、PSK 和状态
 
@@ -931,6 +1072,10 @@ Snell v6 一键管理脚本
   --quiet   减少普通输出，供 systemd 自动升级使用
   --no-auto-update 安装后禁用自动升级
   --auto-update    安装后启用自动升级（默认保留已有开关，新装启用）
+  --auto-update-channel stable|prerelease
+                   自动升级通道；默认 stable（只自动安装正式版）。
+                   手动 update 总是安装官方最新版（含 beta/rc）。
+  --auto    由定时任务使用：按自动升级通道选择版本
   -h        显示帮助
 EOF
 }
@@ -950,6 +1095,17 @@ main() {
         ;;
       --no-auto-update) AUTO_UPDATE="off" ;;
       --auto-update) AUTO_UPDATE="on" ;;
+      --auto) UPDATE_MODE="auto" ;;
+      --auto-update-channel)
+        [[ $# -ge 2 ]] || die "--auto-update-channel 需要 stable 或 prerelease。"
+        AUTO_CHANNEL="$2"; shift
+        [[ "$AUTO_CHANNEL" == stable || "$AUTO_CHANNEL" == prerelease ]] ||
+          die "--auto-update-channel 需要 stable 或 prerelease。"
+        ;;
+      stable|prerelease)
+        [[ "$command" == channel ]] || die "未知参数：$1"
+        AUTO_CHANNEL="$1"
+        ;;
       -h|--help)
         usage
         exit 0
@@ -974,6 +1130,9 @@ main() {
       ;;
     status)
       status_snell
+      ;;
+    channel)
+      channel_snell
       ;;
     uninstall)
       uninstall_snell "$purge"
@@ -1003,7 +1162,7 @@ write_menu() {
 #
 # Usage:
 #   snellx
-#   snellx status|show|update|restart|psk|port|logs|timer|check
+#   snellx status|show|update|restart|psk|port|logs|timer|channel|check|uninstall
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -1019,6 +1178,10 @@ readonly TIMER_NAME="snell-update.timer"
 readonly LOCK_FILE="/run/lock/snell-manager.lock"
 readonly NETWORK_TOOL="/usr/local/sbin/snell-net"
 readonly SECURITY_TOOL="/usr/local/sbin/snell-security"
+readonly AUTO_TOOL="/usr/local/sbin/snell-auto"
+readonly NETWORK_STATE="/var/lib/snell-net"
+readonly SECURITY_STATE="/var/lib/snell-security"
+readonly MENU_MARKER="# snellx - interactive manager for the Snell v6 installation created by snell-v6.sh"
 
 LOCK_HELD=0
 LAST_BACKUP=""
@@ -1165,8 +1328,8 @@ port_is_listening() {
 
 wait_for_port() {
   local port="$1"
-  local attempt
-  for attempt in $(seq 1 10); do
+  local _
+  for _ in $(seq 1 10); do
     if port_is_listening "$port"; then
       return 0
     fi
@@ -1175,11 +1338,24 @@ wait_for_port() {
   return 1
 }
 
+ephemeral_port_range() {
+  local low=0 high=0
+  if [[ -r /proc/sys/net/ipv4/ip_local_port_range ]]; then
+    IFS=$' \t' read -r low high < /proc/sys/net/ipv4/ip_local_port_range || true
+  fi
+  [[ "$low" =~ ^[0-9]+$ && "$high" =~ ^[0-9]+$ ]] || { low=0; high=0; }
+  printf '%s %s\n' "$low" "$high"
+}
+
+# Same policy as the installer: 10000-65000, outside the ephemeral range.
 generate_port() {
-  local port
-  local attempt
-  for attempt in $(seq 1 200); do
-    port="$((20000 + (10#$(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 40001)))"
+  local port low high avoid=1
+  local _
+  IFS=' ' read -r low high < <(ephemeral_port_range)
+  if (( low <= 10000 && high >= 65000 )); then avoid=0; fi
+  for _ in $(seq 1 400); do
+    port="$((10000 + (10#$(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 55001)))"
+    if (( avoid && port >= low && port <= high )); then continue; fi
     if port_is_free "$port"; then
       printf '%s\n' "$port"
       return 0
@@ -1194,6 +1370,18 @@ backup_config() {
   LAST_BACKUP="$(mktemp "${CONFIG_PATH}.bak.${stamp}.XXXXXX")" || die "无法创建配置备份。"
   cp -a -- "$CONFIG_PATH" "$LAST_BACKUP" || die "配置备份失败，未修改配置。"
   info "配置已备份：${LAST_BACKUP}"
+  prune_config_backups
+}
+
+# Keep the newest five config backups (they contain the PSK). Names embed a
+# timestamp, so name order is creation order; cp -a keeps the old mtime.
+prune_config_backups() {
+  local old
+  while IFS= read -r old; do
+    [[ "$old" == "${CONFIG_PATH}.bak."* && ! -L "$old" ]] && rm -f -- "$old"
+  done < <(find "$(dirname "$CONFIG_PATH")" -maxdepth 1 -type f -name "$(basename "$CONFIG_PATH").bak.*" -printf '%f\t%p\n' 2>/dev/null |
+    LC_ALL=C sort -r | awk -F '\t' 'NR > 5 { print $2 }')
+  return 0
 }
 
 restore_backup() {
@@ -1252,7 +1440,8 @@ replace_listen_port() {
 }
 
 firewall_backend() {
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+  # Capture first: with pipefail, "ufw status | grep -q" can fail via SIGPIPE.
+  if command -v ufw >/dev/null 2>&1 && grep -q '^Status: active' <<< "$(ufw status 2>/dev/null)"; then
     printf 'ufw\n'
   elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
     printf 'firewalld\n'
@@ -1488,6 +1677,83 @@ toggle_timer() {
   release_lock
 }
 
+show_or_set_channel() {
+  [[ -x "$MANAGER_PATH" ]] || die "未找到 ${MANAGER_PATH}。"
+  "$MANAGER_PATH" channel "$@"
+}
+
+choose_channel() {
+  local choice=""
+  show_or_set_channel
+  printf '\n1) stable：只自动安装正式版（推荐）\n2) prerelease：也自动安装 beta/rc\n0) 不修改\n'
+  read -r -p "请选择 [0]: " choice
+  case "${choice:-0}" in
+    1) show_or_set_channel stable ;;
+    2)
+      warn "Snell 预发布版曾改变协议，自动升级后可能需要同步升级 Surge。"
+      confirm "确认让自动升级安装 beta/rc？" && show_or_set_channel prerelease
+      ;;
+    0) info "未修改。" ;;
+    *) die "无效选择。" ;;
+  esac
+}
+
+owned_tool() {
+  local target="$1" marker="$2"
+  [[ -f "$target" && ! -L "$target" ]] && grep -Fq "$marker" "$target"
+}
+
+# Undo in reverse order of installation: hardening, network, Snell, tools.
+uninstall_all() {
+  local purge=0 assume_yes=0 arg target
+  for arg in "$@"; do
+    case "$arg" in
+      --purge) purge=1 ;;
+      --yes|-y) assume_yes=1 ;;
+      *) die "uninstall 只接受 --purge 和 --yes。" ;;
+    esac
+  done
+  warn "将依次：回滚安全加固 → 回滚网络参数 → 卸载 Snell 服务 → 删除 snellx 等管理工具。"
+  if (( purge )); then
+    warn "--purge 会同时删除配置、PSK、状态与备份；之后无法用原 PSK 恢复。"
+  else
+    info "配置和 PSK 将保留在 /etc/snell-server，可再次安装恢复。"
+  fi
+  if (( ! assume_yes )); then
+    confirm "确认卸载？" || { info "已取消。"; return 0; }
+  fi
+
+  if [[ -d "${SECURITY_STATE}/baseline" ]]; then
+    [[ -x "$SECURITY_TOOL" ]] || die "存在安全加固基线但缺少 ${SECURITY_TOOL}，已停止卸载。"
+    "$SECURITY_TOOL" rollback || die "安全配置回滚失败，已停止卸载；处理上方提示后重新运行 snellx uninstall。"
+  fi
+  if [[ -d "${NETWORK_STATE}/baseline" ]]; then
+    [[ -x "$NETWORK_TOOL" ]] || die "存在网络参数基线但缺少 ${NETWORK_TOOL}，已停止卸载。"
+    "$NETWORK_TOOL" rollback || die "网络参数回滚失败，已停止卸载；处理上方提示后重新运行 snellx uninstall。"
+  fi
+  if [[ -x "$MANAGER_PATH" ]]; then
+    if (( purge )); then "$MANAGER_PATH" uninstall --purge; else "$MANAGER_PATH" uninstall; fi ||
+      die "Snell 卸载失败，管理工具已保留以便重试。"
+  fi
+
+  owned_tool "$NETWORK_TOOL" 'zzzz-snell-auto-network.conf' && rm -f -- "$NETWORK_TOOL"
+  owned_tool "$SECURITY_TOOL" 'Managed by snell-security' && rm -f -- "$SECURITY_TOOL"
+  owned_tool "$AUTO_TOOL" '# snell-auto: self-contained Linux Snell v6 installer' && rm -f -- "$AUTO_TOOL"
+  if (( purge )); then
+    for target in "$NETWORK_STATE" "$SECURITY_STATE"; do
+      [[ -d "$target" && ! -L "$target" ]] && rm -rf -- "$target"
+    done
+    if id -u snell >/dev/null 2>&1 && ! pgrep -u snell >/dev/null 2>&1; then
+      userdel snell >/dev/null 2>&1 || warn "未能删除系统用户 snell，可稍后手动 userdel snell。"
+    fi
+  fi
+  # Unlinking the running script is safe: Bash keeps the open file.
+  for target in /usr/local/bin/snellx /usr/local/sbin/snellx; do
+    owned_tool "$target" "$MENU_MARKER" && rm -f -- "$target"
+  done
+  ok "卸载完成。防火墙中为 Snell 放行的端口规则未删除，确认不再使用后可手动删除。"
+}
+
 network_command() {
   [[ -x "$NETWORK_TOOL" ]] || die "未安装网络模块，请先运行 snell-auto.sh。"
   "$NETWORK_TOOL" "$@"
@@ -1529,14 +1795,24 @@ health_check() {
     warn "自动升级定时器未运行"
   fi
 
-  if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
-    if ufw status | grep -Eq "^${port}/tcp[[:space:]]+ALLOW"; then
-      ok "UFW 已放行 TCP ${port}"
-    else
-      warn "UFW 未发现 TCP ${port} 放行规则"
-      failed=1
-    fi
-  fi
+  case "$(firewall_backend)" in
+    ufw)
+      if grep -Eq "^${port}/tcp[[:space:]]+ALLOW" <<< "$(ufw status 2>/dev/null)"; then
+        ok "UFW 已放行 TCP ${port}"
+      else
+        warn "UFW 未发现 TCP ${port} 放行规则"
+        failed=1
+      fi
+      ;;
+    firewalld)
+      if firewall-cmd --query-port="${port}/tcp" >/dev/null 2>&1; then
+        ok "firewalld 已放行 TCP ${port}"
+      else
+        warn "firewalld 未放行 TCP ${port}"
+        failed=1
+      fi
+      ;;
+  esac
 
   if [[ "$failed" -eq 0 ]]; then
     ok "检查通过。"
@@ -1564,32 +1840,53 @@ print_menu() {
   printf '  13) 查看安全加固状态\n'
   printf '  14) 应用基础安全加固\n'
   printf '  15) 回滚本工具的安全配置\n'
+  printf '  16) 自动升级通道（正式版/预发布版）\n'
+  printf '  17) 完全卸载（先回滚加固和网络参数）\n'
   printf '  0) 退出\n'
   printf '%s\n' "──────────────────────────────"
+}
+
+# Each action runs in its own subshell with errexit on, so die/exit inside an
+# action (bad input, failed restart) returns to the menu instead of closing it.
+# A lock taken by the action is released when its subshell exits.
+run_menu_action() {
+  local status
+  set +e
+  ( set -e; "$@" )
+  status=$?
+  set -e
+  if (( status != 0 )); then warn "操作未完成（退出码 ${status}），已返回菜单。"; fi
+  return 0
 }
 
 interactive_menu() {
   local choice
   while true; do
     print_menu
-    read -r -p "请选择 [0-15]: " choice || return 0
+    read -r -p "请选择 [0-17]: " choice || return 0
+    choice="${choice//[[:space:]]/}"
     printf '\n'
     case "$choice" in
-      1) show_status || true ;;
-      2) show_connection || true ;;
-      3) update_snell || true ;;
-      4) restart_snell || true ;;
-      5) change_psk || true ;;
-      6) change_port || true ;;
-      7) show_logs || true ;;
-      8) toggle_timer || true ;;
-      9) health_check || true ;;
-      10) network_command diagnose || true ;;
-      11) optimize_network || true ;;
-      12) network_command rollback || true ;;
-      13) security_command status || true ;;
-      14) security_command apply || true ;;
-      15) security_command rollback || true ;;
+      1) run_menu_action require_installation_then show_status ;;
+      2) run_menu_action require_installation_then show_connection ;;
+      3) run_menu_action require_installation_then update_snell ;;
+      4) run_menu_action require_installation_then restart_snell ;;
+      5) run_menu_action require_installation_then change_psk ;;
+      6) run_menu_action require_installation_then change_port ;;
+      7) run_menu_action show_logs ;;
+      8) run_menu_action require_installation_then toggle_timer ;;
+      9) run_menu_action require_installation_then health_check ;;
+      10) run_menu_action network_command diagnose ;;
+      11) run_menu_action optimize_network ;;
+      12) run_menu_action network_command rollback ;;
+      13) run_menu_action security_command status ;;
+      14) run_menu_action security_command apply ;;
+      15) run_menu_action security_command rollback ;;
+      16) run_menu_action require_installation_then choose_channel ;;
+      17)
+        run_menu_action uninstall_all
+        [[ -e /usr/local/sbin/snellx ]] || return 0
+        ;;
       0) printf '再见。\n'; return 0 ;;
       *) warn "无效选择：${choice}" ;;
     esac
@@ -1609,6 +1906,7 @@ usage() {
   snellx port            修改/生成端口
   snellx logs            查看最近日志
   snellx timer           开启/关闭自动升级
+  snellx channel [stable|prerelease] 查看/设置自动升级通道
   snellx check           一键健康检查
   snellx diagnose        检测系统/网络（可追加 --probe IP）
   snellx optimize        应用保守的自适应网络参数
@@ -1616,25 +1914,34 @@ usage() {
   snellx security [--no-packages] 应用基础安全加固
   snellx security-status 查看安全加固状态
   snellx rollback-security 回滚本工具的安全配置
+  snellx uninstall [--purge] [--yes] 回滚加固/网络参数后卸载全部组件
 EOF
+}
+
+require_installation_then() {
+  require_installation
+  "$@"
 }
 
 main() {
   require_root
   require_systemd
-  require_installation
 
+  # Rollback, diagnostics and uninstall must keep working after Snell itself
+  # has been removed; only Snell-specific commands need a full installation.
   case "${1:-menu}" in
     menu) interactive_menu ;;
-    status) show_status ;;
-    show) show_connection ;;
-    update) update_snell ;;
-    restart) restart_snell ;;
-    psk) change_psk ;;
-    port) change_port ;;
+    status) require_installation; show_status ;;
+    show) require_installation; show_connection ;;
+    update) require_installation; update_snell ;;
+    restart) require_installation; restart_snell ;;
+    psk) require_installation; change_psk ;;
+    port) require_installation; change_port ;;
     logs) show_logs ;;
-    timer) toggle_timer ;;
-    check) health_check ;;
+    timer) require_installation; toggle_timer ;;
+    channel) shift; require_installation; show_or_set_channel "$@" ;;
+    check) require_installation; health_check ;;
+    uninstall) shift; uninstall_all "$@" ;;
     diagnose) shift; network_command diagnose "$@" ;;
     optimize) optimize_network ;;
     rollback-network) network_command rollback ;;
@@ -2464,6 +2771,25 @@ sec_connection() {
   SNELL_SECURITY_CLIENT=$source
   SNELL_SECURITY_CONTEXT="user=$user,addr=$source,laddr=$local_ip,lport=$local_port"
 }
+# sudo resets the environment and drops SSH_CONNECTION, which would silently
+# skip Fail2ban and the per-session SSH check. Recover it from the nearest
+# ancestor process (the login shell under sshd); sec_connection still validates it.
+sec_inherit_ssh_connection() {
+  local pid=$$ parent value _
+  [[ -z "${SSH_CONNECTION:-}" ]] || return 0
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+    parent=$(awk '/^PPid:/ {print $2; exit}' "$SNELL_SECURITY_PROC/$pid/status" 2>/dev/null)
+    [[ "$parent" =~ ^[0-9]+$ ]] && (( parent > 1 )) || return 0
+    pid=$parent
+    [[ -r "$SNELL_SECURITY_PROC/$pid/environ" ]] || continue
+    value=$(tr '\0' '\n' < "$SNELL_SECURITY_PROC/$pid/environ" 2>/dev/null | sed -n 's/^SSH_CONNECTION=//p' | head -n 1)
+    if [[ -n "$value" ]]; then
+      SSH_CONNECTION=$value
+      sec_log '已从上级 SSH 会话识别当前连接来源（sudo 会清除 SSH_CONNECTION）'
+      return 0
+    fi
+  done
+}
 sec_ssh_auth_view() {
   # Compare every effective value other than the four intentionally hardened keys.
   awk '$1!="permitemptypasswords" && $1!="x11forwarding" && $1!="logingracetime" && $1!="loglevel"' "$1" | LC_ALL=C sort
@@ -2522,7 +2848,7 @@ sec_ssh() {
   sec_log 'SSH 加固生效；已验证认证方式、端口及转发不变，只执行 reload'
 }
 sec_collect_ports() {
-  local directory=$1 port line listener source sport local_ip local_port extra
+  local directory=$1 port line listener local_port
   SNELL_SECURITY_PORTS=''
   [[ -n "$SNELL_SECURITY_SSHD" ]] || return 1
   "$SNELL_SECURITY_SSHD" -T > "$directory/ssh-ports" || return 1
@@ -2539,7 +2865,7 @@ sec_collect_ports() {
     sec_valid_port "$port" || return 1
     printf '%s\n' "$((10#$port))" >> "$directory/ports"
   done < "$directory/listeners"
-  read -r source sport local_ip local_port extra <<< "$SSH_CONNECTION"
+  read -r _ _ _ local_port _ <<< "$SSH_CONNECTION"
   sec_valid_port "$local_port" || return 1
   printf '%s\n' "$((10#$local_port))" >> "$directory/ports"
   SNELL_SECURITY_PORTS=$(LC_ALL=C sort -nu "$directory/ports" | paste -sd, -)
@@ -2566,9 +2892,36 @@ sec_stop_fail2ban() {
     if systemctl is-active --quiet fail2ban.service; then sec_warn 'Fail2ban 仍在运行，保留 jail 与白名单'; return 1; fi
   fi
 }
+# A re-run from a new address (dynamic home IP) adds that address to the
+# whitelist of the jail this tool created; at most five client addresses are kept.
+sec_fail2ban_refresh() {
+  local directory=$1 entries=() kept=() entry
+  if ! sec_connection; then sec_log 'Fail2ban 由本工具管理；未识别当前 SSH 来源，白名单保持不变'; return 0; fi
+  read -r -a entries <<< "$(awk -F ' = ' '$1=="ignoreip" {print $2; exit}' "$SNELL_SECURITY_JAIL")"
+  (( ${#entries[@]} > 0 )) || { sec_warn 'Fail2ban jail 中没有 ignoreip，白名单保持不变'; return 0; }
+  for entry in "${entries[@]}"; do
+    if [[ "$entry" == "$SNELL_SECURITY_CLIENT" ]]; then sec_log "Fail2ban 白名单已包含当前 SSH 来源 $SNELL_SECURITY_CLIENT"; return 0; fi
+    [[ "$entry" == 127.0.0.0/8 || "$entry" == ::1 ]] || kept+=("$entry")
+  done
+  kept+=("$SNELL_SECURITY_CLIENT")
+  (( ${#kept[@]} <= 5 )) || kept=("${kept[@]: -5}")
+  grep -vFx "$SNELL_SECURITY_MARKER" "$SNELL_SECURITY_JAIL" |
+    awk -v list="127.0.0.0/8 ::1 ${kept[*]}" '/^ignoreip = / {print "ignoreip = " list; next} {print}' > "$directory/jail-plan" || return 1
+  : > "$directory/touched.jail" || return 1
+  sec_write_file "$SNELL_SECURITY_JAIL" "$directory/jail-plan" || return 1
+  if ! fail2ban-client -t >/dev/null 2>&1 || ! fail2ban-client reload snell-auto-sshd >/dev/null 2>&1; then
+    sec_restore_file "$directory" jail || return 1
+    fail2ban-client reload snell-auto-sshd >/dev/null 2>&1 || true
+    sec_warn 'Fail2ban 白名单更新失败，已恢复原 jail'; return 0
+  fi
+  sec_log "已把当前 SSH 来源 $SNELL_SECURITY_CLIENT 加入 Fail2ban 白名单"
+}
 sec_fail2ban() {
   local directory=$1 action='' enabled
-  if systemctl is-active --quiet fail2ban.service; then sec_log 'Fail2ban 已运行：保留现有配置与封禁规则，不接管'; return 0; fi
+  if systemctl is-active --quiet fail2ban.service; then
+    if sec_owned "$SNELL_SECURITY_JAIL" && sec_matches_expected jail; then sec_fail2ban_refresh "$directory"; return; fi
+    sec_log 'Fail2ban 已运行：保留现有配置与封禁规则，不接管'; return 0
+  fi
   if command -v fail2ban-client >/dev/null 2>&1 && ! sec_owned "$SNELL_SECURITY_JAIL"; then sec_log 'Fail2ban 已安装：保留现有配置，不自动启动或接管'; return 0; fi
   sec_find_sshd
   if ! sec_ssh_default_service || ! sec_connection || ! sec_collect_ports "$directory"; then
@@ -2819,6 +3172,7 @@ sec_main() {
   exec 9> "$SNELL_SECURITY_STATE/lock" || return 1
   flock -n 9 || { sec_warn '另一个安全管理任务正在运行'; return 1; }
   sec_recover_pending || return 1
+  [[ "$action" != apply ]] || sec_inherit_ssh_connection
   trap sec_abort EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
