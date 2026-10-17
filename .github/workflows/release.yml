@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build, verify and publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Tag must match release.json
+        run: |
+          expected="$(python3 -c 'import json; print(json.load(open("release.json"))["tag"])')"
+          if [ "$expected" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match release.json ($expected)" >&2
+            exit 1
+          fi
+      - name: Reproduce distribution and bootstrap
+        run: |
+          python3 scripts/build-snell-auto.py
+          python3 scripts/render-release-installer.py
+          git diff --exit-code -- outputs/snell-auto.sh outputs/snell-auto.sh.sha256 install.sh
+      - name: Bootstrap digest matches bundle
+        run: |
+          digest="$(sha256sum outputs/snell-auto.sh | cut -d' ' -f1)"
+          grep -Fq "expected_sha256='$digest'" install.sh
+      - name: Offline regression tests
+        run: |
+          for test_file in tests/test-*.py; do
+            python3 "$test_file"
+          done
+          bash tests/snell-net-tests.sh
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" outputs/snell-auto.sh outputs/snell-auto.sh.sha256 --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$GITHUB_REF_NAME" outputs/snell-auto.sh outputs/snell-auto.sh.sha256 \
+              --title "SnellX $GITHUB_REF_NAME" --notes-file RELEASE_NOTES.md --verify-tag --repo "$GITHUB_REPOSITORY"
+          fi

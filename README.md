@@ -36,7 +36,7 @@ bash snellx-install.sh security-status                 # 查看安全状态
 bash snellx-install.sh rollback-security               # 回滚本工具安全配置
 ```
 
-指定发布版可把入口 URL 中的 `main` 改为 `v1.0.0`。完整单文件及校验文件也可在 [Releases](https://github.com/nuvora-f44c84/SnellX/releases) 下载，上传至 VPS 后执行 `bash snell-auto.sh`。不要直接把完整 `snell-auto.sh` 管道传给 Bash，它需要安装自身的持久副本。
+指定发布版可把入口 URL 中的 `main` 改为对应 tag（如 `v1.1.0`）。完整单文件及校验文件也可在 [Releases](https://github.com/nuvora-f44c84/SnellX/releases) 下载，上传至 VPS 后执行 `bash snell-auto.sh`。不要直接把完整 `snell-auto.sh` 管道传给 Bash，它需要安装自身的持久副本。
 
 ## 功能和边界
 
@@ -48,7 +48,8 @@ bash snellx-install.sh rollback-security               # 回滚本工具安全�
 - 自动更新设置只适配已安装 unattended-upgrades 的 Debian/Ubuntu，保留更新来源并禁止自动重启。
 - 不重启 VPS，不更换内核，不修改路由或 DNS。重启/升级 Snell 会中断现有代理连接。
 - 回滚不能卸载已安装软件包或撤销已发生的软件更新；配置被手工改过会报告冲突。保留服务商 VNC / 串口入口。
-- Snell 自动更新可选取官方 v6 beta/rc；不是“只安装正式版”。只有本机检查，不能代替用户本地到 VPS 的真实连通和吞吐测试。
+- 首装和手动更新安装官方最新 v6（目前只有 beta/rc）；每日自动更新默认只安装正式版，可用 `snellx channel prerelease` 改为也跟进 beta/rc。只有本机检查，不能代替用户本地到 VPS 的真实连通和吞吐测试。
+- `snellx uninstall [--purge]` 依次回滚安全加固、网络参数并卸载全部组件。
 
 详细说明、路径及回滚命令见 [操作手册](outputs/README.md)。请勿在公开 Issue 上传 PSK、私钥、完整连接配置或未脱敏日志。
 
@@ -65,4 +66,4 @@ bash tests/snell-net-tests.sh
 
 GitHub Actions 在 Ubuntu 上运行同样的离线回归测试及构建一致性检查。它不等于真实 systemd、SSH 重连或防火墙封禁动作的部署验收。
 
-发布前更新 `release.json`，重新构建并生成入口；创建对应 tag 后将 `outputs/snell-auto.sh` 和 `outputs/snell-auto.sh.sha256` 上传为 Release 附件。入口依赖这些附件，未上传时会拒绝继续。
+发布流程：更新 `release.json` 和 `RELEASE_NOTES.md`，重新构建并生成入口，合并到 main 后推送同名 tag（如 `git tag v1.1.0 && git push origin v1.1.0`）。Release 工作流会重新构建、核对哈希与 `install.sh` 一致，并自动创建 Release、上传 `snell-auto.sh` 和 `.sha256`。入口依赖这些附件；合并到推送 tag 之间，main 上的一键命令会因下载不到附件而安全中止。

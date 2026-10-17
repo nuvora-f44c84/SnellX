@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Release bootstrap. Generated install.sh pins a release and its bundle digest.
-# This template is not a runnable release until its three placeholders are set.
+# __TEMPLATE_NOTE__
 
 snell_release_usage() {
   cat <<'USAGE'
@@ -13,6 +13,9 @@ Snell 一键安装入口（固定发行版 + SHA-256 校验）
   sudo bash install.sh security                单独应用安全加固
   sudo bash install.sh security-status         查看安全加固状态
   sudo bash install.sh rollback-security       回滚本工具的安全配置
+  sudo bash install.sh install --no-auto-update 禁用 Snell 自动升级
+  sudo bash install.sh install --auto-update-channel prerelease
+                                               自动升级也安装 beta/rc（默认只装正式版）
   bash install.sh --help                       显示帮助，不联网
 
 仅支持 Linux VPS。下载的安装包通过固定 SHA-256 与 Bash 语法检查后才运行。

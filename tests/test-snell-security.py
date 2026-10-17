@@ -383,6 +383,73 @@ sec_connection && sec_collect_ports "$TEST_ROOT/s" && printf 'PORTS=%s\n' "$SNEL
         self.assertIn("PORTS=22,2222,49764", result.stdout)
 
 
+    def test_sudo_recovers_ssh_connection_from_parent_session(self):
+        result = self.run_shell(r"""
+SNELL_SECURITY_PROC="$TEST_ROOT/proc"
+mkdir -p "$SNELL_SECURITY_PROC/$$" "$SNELL_SECURITY_PROC/777"
+printf 'Name:\tbash\nPPid:\t777\n' > "$SNELL_SECURITY_PROC/$$/status"
+printf 'Name:\tbash\nPPid:\t1\n' > "$SNELL_SECURITY_PROC/777/status"
+printf 'HOME=/root\0SSH_CONNECTION=198.51.100.4 50000 203.0.113.5 22\0' > "$SNELL_SECURITY_PROC/777/environ"
+sec_inherit_ssh_connection
+printf 'GOT=%s\n' "$SSH_CONNECTION"
+sec_connection && printf 'CLIENT=%s\n' "$SNELL_SECURITY_CLIENT"
+""", SUDO_USER="admin")
+        self.assert_ok(result)
+        self.assertIn("GOT=198.51.100.4 50000 203.0.113.5 22", result.stdout)
+        self.assertIn("CLIENT=198.51.100.4", result.stdout)
+
+    def test_existing_session_value_is_not_replaced(self):
+        result = self.run_shell(r"""
+sec_inherit_ssh_connection
+printf 'GOT=%s\n' "$SSH_CONNECTION"
+""", SSH_CONNECTION="192.0.2.9 1 203.0.113.5 22")
+        self.assert_ok(result)
+        self.assertIn("GOT=192.0.2.9 1 203.0.113.5 22", result.stdout)
+
+    def _owned_active_jail(self, ignore):
+        self.change_state(lambda state: state["services"].update({"fail2ban.service": ["enabled", "active"]}))
+        self.jail.parent.mkdir(parents=True)
+        body = ("[sshd]\nenabled = false\n\n[snell-auto-sshd]\nenabled = true\nport = 22\n"
+                f"ignoreip = {ignore}\n")
+        result = self.run_shell(r"""
+printf '%s' "$BODY" > "$TEST_ROOT/plan"
+sec_write_file "$SNELL_SECURITY_JAIL" "$TEST_ROOT/plan"
+""", BODY=body)
+        self.assert_ok(result)
+
+    def test_owned_fail2ban_whitelist_adds_new_ssh_source(self):
+        self._owned_active_jail("127.0.0.0/8 ::1 192.0.2.1")
+        result = self.run_shell(
+            'sec_snapshot "$TEST_ROOT/s" && sec_fail2ban "$TEST_ROOT/s"',
+            overrides='fail2ban-client() { printf "F2B %s\\n" "$*" >> "$TEST_ROOT/f2b"; }',
+            SSH_CONNECTION="198.51.100.4 12345 203.0.113.5 22")
+        self.assert_ok(result)
+        self.assertIn("ignoreip = 127.0.0.0/8 ::1 192.0.2.1 198.51.100.4\n", self.jail.read_text())
+        self.assertIn("F2B reload snell-auto-sshd", (self.root / "f2b").read_text())
+        self.assertTrue((self.root / "s/touched.jail").exists())
+
+    def test_owned_fail2ban_whitelist_keeps_five_recent_sources(self):
+        self._owned_active_jail("127.0.0.0/8 ::1 192.0.2.1 192.0.2.2 192.0.2.3 192.0.2.4 192.0.2.5")
+        result = self.run_shell(
+            'sec_snapshot "$TEST_ROOT/s" && sec_fail2ban "$TEST_ROOT/s"',
+            overrides='fail2ban-client() { return 0; }',
+            SSH_CONNECTION="198.51.100.4 12345 203.0.113.5 22")
+        self.assert_ok(result)
+        self.assertIn("ignoreip = 127.0.0.0/8 ::1 192.0.2.2 192.0.2.3 192.0.2.4 192.0.2.5 198.51.100.4\n",
+                      self.jail.read_text())
+
+    def test_owned_fail2ban_reload_failure_restores_jail(self):
+        self._owned_active_jail("127.0.0.0/8 ::1 192.0.2.1")
+        before = self.jail.read_text()
+        result = self.run_shell(
+            'sec_snapshot "$TEST_ROOT/s" && sec_fail2ban "$TEST_ROOT/s"',
+            overrides='fail2ban-client() { [[ "$1" != reload ]]; }',
+            SSH_CONNECTION="198.51.100.4 12345 203.0.113.5 22")
+        self.assert_ok(result)
+        self.assertEqual(self.jail.read_text(), before)
+        self.assertIn("已恢复原 jail", result.stderr)
+
+
 MOCK_SHELL = r'''
 eval "$(declare -f sec_package | sed '1s/sec_package/real_sec_package/')"
 # Dependency presence is a fixture, not a property of the CI runner's packages.

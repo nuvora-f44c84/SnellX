@@ -299,6 +299,80 @@ install() {
         self.assertIn("restart-old-working", self.calls.read_text())
 
 
+    def test_stable_channel_ignores_prereleases(self):
+        page = "\n".join(asset(v) for v in ("v6.0.0rc2", "v6.1.0beta1", "v6.0.1", "v6.0.0"))
+        result = self.run_bash('select_release_url "amd64" stable', stdin=page)
+        self.assert_success(result)
+        self.assertEqual(result.stdout.strip(), asset("v6.0.1"))
+        result = self.run_bash('select_release_url "amd64" stable', stdin=asset("v6.0.0rc2"))
+        self.assert_success(result)
+        self.assertEqual(result.stdout.strip(), "")
+
+    def test_auto_update_skips_when_only_prereleases_exist(self):
+        original = self.seed_installation("v6.0.0rc")
+        self.page.write_text(asset("v6.0.0rc2") + "\n", encoding="utf-8")
+        result = self.run_bash(
+            "UPDATE_MODE=auto\nperform_update yes",
+            overrides="detect_asset_arch() { printf 'amd64\\n'; }\n"
+                      "download_and_verify_binary() { printf 'download\\n' >> \"$TEST_CALLS\"; return 1; }",
+        )
+        self.assert_success(result)
+        self.assertEqual(self.bin.read_bytes(), original)
+        self.assertNotIn("download", self.calls.read_text())
+        self.assertNotIn("systemctl", self.calls.read_text())
+
+    def test_prerelease_channel_and_manual_update_still_take_prereleases(self):
+        for setup in ("UPDATE_MODE=manual", "UPDATE_MODE=auto\nprintf 'prerelease\\n' > \"$CHANNEL_STATE\""):
+            with self.subTest(setup=setup):
+                self.seed_installation("v6.0.0rc")
+                self.calls.write_text("")
+                self.page.write_text(asset("v6.0.0rc2") + "\n", encoding="utf-8")
+                result = self.run_bash(
+                    setup + "\nperform_update no",
+                    overrides="detect_asset_arch() { printf 'amd64\\n'; }\n"
+                              "download_and_verify_binary() { printf 'download\\n' >> \"$TEST_CALLS\"; "
+                              "cp \"$TEST_NEW_BINARY\" \"$TMP_DIR/snell-server\"; }",
+                )
+                self.assert_success(result)
+                self.assertIn("download", self.calls.read_text())
+                self.assertEqual(self.release.read_text().strip(), "v6.0.0rc2")
+
+    def test_elf_check_matches_architecture(self):
+        def elf(machine):
+            data = bytearray(64)
+            data[0:4] = b"\x7fELF"
+            data[18:20] = machine.to_bytes(2, "little")
+            return bytes(data)
+        cases = ((elf(62), "amd64", True), (elf(183), "aarch64", True), (elf(3), "i386", True),
+                 (elf(183), "amd64", False), (elf(62), "aarch64", False),
+                 (b"#!/bin/sh\necho snell-server v6.0.0\n", "amd64", False))
+        for content, arch, expected in cases:
+            with self.subTest(arch=arch, expected=expected):
+                target = self.root / "candidate"
+                target.write_bytes(content)
+                result = self.run_bash(f'elf_matches_arch "{target}" {arch}')
+                self.assertEqual(result.returncode == 0, expected, result.stderr)
+
+    def test_generated_port_avoids_ephemeral_range(self):
+        result = self.run_bash(
+            "ephemeral_port_range() { printf '32768 60999\\n'; }\n"
+            "port_in_use() { return 1; }\n"
+            "for i in $(seq 1 300); do generate_port; done")
+        self.assert_success(result)
+        ports = [int(x) for x in result.stdout.split()]
+        self.assertEqual(len(ports), 300)
+        self.assertTrue(all(10000 <= x <= 65000 and not 32768 <= x <= 60999 for x in ports))
+
+    def test_old_update_backups_are_pruned(self):
+        backups = self.state / "backups"
+        for minute in range(8):
+            (backups / f"update-20261017-1200{minute}0.abc{minute}").mkdir(parents=True)
+        result = self.run_bash('prune_backups "$STATE_DIR/backups" "update-*"')
+        self.assert_success(result)
+        remaining = sorted(path.name for path in backups.iterdir())
+        self.assertEqual(remaining, [f"update-20261017-1200{m}0.abc{m}" for m in range(3, 8)])
+
+
 MOCK_COMMANDS = r'''
 QUIET=1
 install() { "$TEST_PYTHON" "$TEST_HELPER" install "$@"; }

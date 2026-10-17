@@ -303,6 +303,25 @@ sec_connection() {
   SNELL_SECURITY_CLIENT=$source
   SNELL_SECURITY_CONTEXT="user=$user,addr=$source,laddr=$local_ip,lport=$local_port"
 }
+# sudo resets the environment and drops SSH_CONNECTION, which would silently
+# skip Fail2ban and the per-session SSH check. Recover it from the nearest
+# ancestor process (the login shell under sshd); sec_connection still validates it.
+sec_inherit_ssh_connection() {
+  local pid=$$ parent value _
+  [[ -z "${SSH_CONNECTION:-}" ]] || return 0
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+    parent=$(awk '/^PPid:/ {print $2; exit}' "$SNELL_SECURITY_PROC/$pid/status" 2>/dev/null)
+    [[ "$parent" =~ ^[0-9]+$ ]] && (( parent > 1 )) || return 0
+    pid=$parent
+    [[ -r "$SNELL_SECURITY_PROC/$pid/environ" ]] || continue
+    value=$(tr '\0' '\n' < "$SNELL_SECURITY_PROC/$pid/environ" 2>/dev/null | sed -n 's/^SSH_CONNECTION=//p' | head -n 1)
+    if [[ -n "$value" ]]; then
+      SSH_CONNECTION=$value
+      sec_log '已从上级 SSH 会话识别当前连接来源（sudo 会清除 SSH_CONNECTION）'
+      return 0
+    fi
+  done
+}
 sec_ssh_auth_view() {
   # Compare every effective value other than the four intentionally hardened keys.
   awk '$1!="permitemptypasswords" && $1!="x11forwarding" && $1!="logingracetime" && $1!="loglevel"' "$1" | LC_ALL=C sort
@@ -361,7 +380,7 @@ sec_ssh() {
   sec_log 'SSH 加固生效；已验证认证方式、端口及转发不变，只执行 reload'
 }
 sec_collect_ports() {
-  local directory=$1 port line listener source sport local_ip local_port extra
+  local directory=$1 port line listener local_port
   SNELL_SECURITY_PORTS=''
   [[ -n "$SNELL_SECURITY_SSHD" ]] || return 1
   "$SNELL_SECURITY_SSHD" -T > "$directory/ssh-ports" || return 1
@@ -378,7 +397,7 @@ sec_collect_ports() {
     sec_valid_port "$port" || return 1
     printf '%s\n' "$((10#$port))" >> "$directory/ports"
   done < "$directory/listeners"
-  read -r source sport local_ip local_port extra <<< "$SSH_CONNECTION"
+  read -r _ _ _ local_port _ <<< "$SSH_CONNECTION"
   sec_valid_port "$local_port" || return 1
   printf '%s\n' "$((10#$local_port))" >> "$directory/ports"
   SNELL_SECURITY_PORTS=$(LC_ALL=C sort -nu "$directory/ports" | paste -sd, -)
@@ -405,9 +424,36 @@ sec_stop_fail2ban() {
     if systemctl is-active --quiet fail2ban.service; then sec_warn 'Fail2ban 仍在运行，保留 jail 与白名单'; return 1; fi
   fi
 }
+# A re-run from a new address (dynamic home IP) adds that address to the
+# whitelist of the jail this tool created; at most five client addresses are kept.
+sec_fail2ban_refresh() {
+  local directory=$1 entries=() kept=() entry
+  if ! sec_connection; then sec_log 'Fail2ban 由本工具管理；未识别当前 SSH 来源，白名单保持不变'; return 0; fi
+  read -r -a entries <<< "$(awk -F ' = ' '$1=="ignoreip" {print $2; exit}' "$SNELL_SECURITY_JAIL")"
+  (( ${#entries[@]} > 0 )) || { sec_warn 'Fail2ban jail 中没有 ignoreip，白名单保持不变'; return 0; }
+  for entry in "${entries[@]}"; do
+    if [[ "$entry" == "$SNELL_SECURITY_CLIENT" ]]; then sec_log "Fail2ban 白名单已包含当前 SSH 来源 $SNELL_SECURITY_CLIENT"; return 0; fi
+    [[ "$entry" == 127.0.0.0/8 || "$entry" == ::1 ]] || kept+=("$entry")
+  done
+  kept+=("$SNELL_SECURITY_CLIENT")
+  (( ${#kept[@]} <= 5 )) || kept=("${kept[@]: -5}")
+  grep -vFx "$SNELL_SECURITY_MARKER" "$SNELL_SECURITY_JAIL" |
+    awk -v list="127.0.0.0/8 ::1 ${kept[*]}" '/^ignoreip = / {print "ignoreip = " list; next} {print}' > "$directory/jail-plan" || return 1
+  : > "$directory/touched.jail" || return 1
+  sec_write_file "$SNELL_SECURITY_JAIL" "$directory/jail-plan" || return 1
+  if ! fail2ban-client -t >/dev/null 2>&1 || ! fail2ban-client reload snell-auto-sshd >/dev/null 2>&1; then
+    sec_restore_file "$directory" jail || return 1
+    fail2ban-client reload snell-auto-sshd >/dev/null 2>&1 || true
+    sec_warn 'Fail2ban 白名单更新失败，已恢复原 jail'; return 0
+  fi
+  sec_log "已把当前 SSH 来源 $SNELL_SECURITY_CLIENT 加入 Fail2ban 白名单"
+}
 sec_fail2ban() {
   local directory=$1 action='' enabled
-  if systemctl is-active --quiet fail2ban.service; then sec_log 'Fail2ban 已运行：保留现有配置与封禁规则，不接管'; return 0; fi
+  if systemctl is-active --quiet fail2ban.service; then
+    if sec_owned "$SNELL_SECURITY_JAIL" && sec_matches_expected jail; then sec_fail2ban_refresh "$directory"; return; fi
+    sec_log 'Fail2ban 已运行：保留现有配置与封禁规则，不接管'; return 0
+  fi
   if command -v fail2ban-client >/dev/null 2>&1 && ! sec_owned "$SNELL_SECURITY_JAIL"; then sec_log 'Fail2ban 已安装：保留现有配置，不自动启动或接管'; return 0; fi
   sec_find_sshd
   if ! sec_ssh_default_service || ! sec_connection || ! sec_collect_ports "$directory"; then
@@ -658,6 +704,7 @@ sec_main() {
   exec 9> "$SNELL_SECURITY_STATE/lock" || return 1
   flock -n 9 || { sec_warn '另一个安全管理任务正在运行'; return 1; }
   sec_recover_pending || return 1
+  [[ "$action" != apply ]] || sec_inherit_ssh_connection
   trap sec_abort EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
